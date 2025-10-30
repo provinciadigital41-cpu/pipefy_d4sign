@@ -14,20 +14,33 @@ const {
   TEMPLATE_UUID_CONTRATO,
   PHASE_ID_PROPOSTA,
   PHASE_ID_CONTRATO_ENVIADO,
-  COFRE_UUID_LUCAS,
-  COFRE_UUID_MARIA,
-  COFRE_UUID_JOAO
+  COFRE_UUID_EDNA,
+  COFRE_UUID_GREYCE,
+  COFRE_UUID_MARIANA,
+  COFRE_UUID_VALDEIR,
+  COFRE_UUID_DEBORA,
+  COFRE_UUID_MAYKON,
+  COFRE_UUID_JEFERSON,
+  COFRE_UUID_RONALDO,
+  COFRE_UUID_BRENDA,
+  COFRE_UUID_MAURO,
 } = process.env;
 
-// ====== SUBSTITUA PELOS IDS REAIS DOS SEUS CAMPOS DO PIPEFY ======
-const FIELD_ID_CHECKBOX_DISPARO = 'checkbox_disparo'; // Ex.: "campo_checkbox_123"
-const FIELD_ID_LINKS_D4 = 'link_documentos_d4'; // Ex.: "campo_link_456"
-// =================================================================
+
+const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato';
+const FIELD_ID_LINKS_D4 = 'd4_contrato'; 
 
 const COFRES_UUIDS = {
-  'Lucas Santos': COFRE_UUID_LUCAS,
-  'Maria Lima': COFRE_UUID_MARIA,
-  'João Silva': COFRE_UUID_JOAO
+  'EDNA BERTO DA SILVA': COFRE_UUID_EDNA,
+  'Greyce Maria Candido Souza': COFRE_UUID_GREYCE,
+  'mariana cristina de oliveira': COFRE_UUID_MARIANA,
+  'Valdeir Almedia': COFRE_UUID_VALDEIR,
+  'Débora Gonçalves': COFRE_UUID_DEBORA,
+  'Maykon Campos': COFRE_UUID_MAYKON,
+  'Jeferson Andrade Siqueira': COFRE_UUID_JEFERSON,
+  'RONALDO SCARIOT DA SILVA': COFRE_UUID_RONALDO,
+  'BRENDA ROSA DA SILVA': COFRE_UUID_BRENDA,
+  'Mauro Furlan Neto': COFRE_UUID_MAURO
 };
 
 const CARD_Q = `
