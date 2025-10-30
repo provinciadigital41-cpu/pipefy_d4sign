@@ -1,0 +1,11 @@
+{
+  "name": "pipefy-d4sign",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
+}
