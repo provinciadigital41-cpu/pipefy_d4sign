@@ -1,8 +1,8 @@
-
-FROM node:20-alpine
+FROM node:18-alpine
+RUN apk add --no-cache bash curl iputils
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci --only=production || npm i --only=production
-COPY server.js ./
+COPY package*.json ./
+RUN npm install
+COPY . .
 EXPOSE 3000
 CMD ["node", "server.js"]
