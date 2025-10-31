@@ -14,7 +14,7 @@ COPY package*.json ./
 RUN npm install
 
 # Copia o código da aplicação
-COPY . .
+COPY entrypoint.sh .
 
 RUN chmod +x ./entrypoint.sh
 
