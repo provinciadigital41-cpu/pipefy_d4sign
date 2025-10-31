@@ -83,7 +83,7 @@ function montarDados(card) {
     nome: getField(f, 'nome_do_contato'),
     email: getField(f, 'email_profissional'),
     telefone: getField(f, 'telefone'),
-    cnpj: getField(f, 'cnpj'),
+    cnpj: getField(f, 'cpf_cnpj'),
     servicos: getField(f, 'servi_os_de_contratos') || '',
     valor: getField(f, 'valor_do_neg_cio') || '',
     parcelas: getField(f, 'quantidade_de_parcelas') || '1',
