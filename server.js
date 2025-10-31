@@ -1,10 +1,25 @@
+// ============================================================================
+// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries e DNS preflight)
+// ============================================================================
 
-import express from 'express';
-import fetch from 'node-fetch';
+const express = require('express');
+const fetch = require('node-fetch');
+const dns = require('dns').promises;
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+const { AbortController } = require('abort-controller');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// Keep-Alive agents para conexões mais estáveis
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 60_000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: 60_000 });
+
+// ============================================================================
+// VARIÁVEIS DE AMBIENTE
+// ============================================================================
 const {
   PORT = 3000,
   PIPE_API_KEY,
@@ -26,9 +41,8 @@ const {
   COFRE_UUID_MAURO,
 } = process.env;
 
-
 const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato';
-const FIELD_ID_LINKS_D4 = 'd4_contrato'; 
+const FIELD_ID_LINKS_D4 = 'd4_contrato';
 
 const COFRES_UUIDS = {
   'EDNA BERTO DA SILVA': COFRE_UUID_EDNA,
@@ -43,32 +57,88 @@ const COFRES_UUIDS = {
   'Mauro Furlan Neto': COFRE_UUID_MAURO
 };
 
-const CARD_Q = `
-query($cardId: ID!) {
-  card(id: $cardId) {
-    id title assignees { name } current_phase { id name }
-    fields { name value report_value field { id internal_id }}
+// ============================================================================
+// HELPERS: DNS preflight + fetch com retry/backoff/timeout
+// ============================================================================
+
+async function preflightDNS() {
+  const hosts = ['api.pipefy.com', 'api.d4sign.com.br', 'secure.d4sign.com.br', 'google.com'];
+  for (const host of hosts) {
+    try {
+      const { address } = await dns.lookup(host, { family: 4 });
+      console.log(`[DNS] ${host} → ${address}`);
+    } catch (e) {
+      console.warn(`[DNS-AVISO] Falha ao resolver ${host}: ${e.code || e.message}`);
+    }
   }
-}`;
+}
 
-const SET_FIELD_Q = `
-mutation($input: SetFieldValueInput!) {
-  setFieldValue(input: $input) { card { id } }
-}`;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-const MOVE_CARD_Q = `
-mutation($input: MoveCardToPhaseInput!) {
-  moveCardToPhase(input: $input) { card { id current_phase { id name } } }
-}`;
+const TRANSIENT_CODES = new Set([
+  'EAI_AGAIN', 'ENOTFOUND', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'
+]);
 
+async function fetchWithRetry(url, options = {}, {
+  attempts = 5,
+  baseDelayMs = 400,
+  timeoutMs = 15000
+} = {}) {
+
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    const u = new URL(url);
+    const agent = u.protocol === 'http:' ? httpAgent : httpsAgent;
+
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(url, {
+        ...options,
+        agent,
+        signal: controller.signal
+      });
+      clearTimeout(to);
+      return res;
+    } catch (e) {
+      clearTimeout(to);
+      lastErr = e;
+      const code = e.code || e.errno || e.type;
+
+      const transient = TRANSIENT_CODES.has(code) || e.name === 'AbortError';
+      const isLast = i === attempts;
+
+      console.warn(`[HTTP-RETRY] ${u.host} tentativa ${i}/${attempts} → ${code || e.message}`);
+
+      if (!transient || isLast) {
+        throw e;
+      }
+      const delay = baseDelayMs * Math.pow(2, i - 1); // backoff exponencial
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+// ============================================================================
+// GRAPHQL / PIPEFY
+// ============================================================================
 async function gql(query, vars) {
-  const res = await fetch(PIPE_GRAPHQL_ENDPOINT, {
+  const res = await fetchWithRetry(PIPE_GRAPHQL_ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PIPE_API_KEY}` },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${PIPE_API_KEY}`
+    },
     body: JSON.stringify({ query, variables: vars })
-  });
-  const json = await res.json();
-  if (!res.ok || json.errors) throw new Error(JSON.stringify(json.errors || res.statusText));
+  }, { attempts: 5, baseDelayMs: 500, timeoutMs: 20000 });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.errors) {
+    console.error('[Pipefy GraphQL ERRO]', json.errors || res.statusText);
+    throw new Error(JSON.stringify(json.errors || res.statusText));
+  }
   return json.data;
 }
 
@@ -114,6 +184,9 @@ function montarSigners(d) {
   }];
 }
 
+// ============================================================================
+// D4SIGN
+// ============================================================================
 async function criarDocumentoD4(token, cryptKey, uuidTemplate, title, add, signers, cofreUuid) {
   const url = `https://api.d4sign.com.br/api/v1/documents/${uuidTemplate}/templates`;
 
@@ -134,7 +207,8 @@ async function criarDocumentoD4(token, cryptKey, uuidTemplate, title, add, signe
     }]
   };
 
-  const res = await fetch(url, {
+  console.log(`[D4SIGN] POST ${url}`);
+  const res = await fetchWithRetry(url, {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
@@ -143,27 +217,53 @@ async function criarDocumentoD4(token, cryptKey, uuidTemplate, title, add, signe
       'cryptKey': cryptKey
     },
     body: JSON.stringify(body)
-  });
+  }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
 
-  const data = await res.json();
-  if (!res.ok || !Array.isArray(data) || !data[0]?.uuid_document)
-    throw new Error(`Erro D4Sign: ${res.status}`);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = null; }
 
+  if (!res.ok || !Array.isArray(data) || !data[0]?.uuid_document) {
+    console.error(`[ERRO D4SIGN] HTTP ${res.status} → ${text}`);
+    throw new Error(`Falha D4Sign: ${res.status}`);
+  }
+
+  console.log(`[D4SIGN] OK uuid=${data[0].uuid_document}`);
   return data[0].uuid_document;
 }
+
+// ============================================================================
+// ROTAS
+// ============================================================================
+app.get('/', (req, res) => res.send('Servidor ativo e rodando'));
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.post('/pipefy', async (req, res) => {
   const cardId = req.body?.data?.action?.card?.id;
   if (!cardId) return res.status(400).json({ error: 'Sem cardId' });
 
   try {
-    const data = await gql(CARD_Q, { cardId });
+    // Preflight rápido (não bloqueia o fluxo)
+    preflightDNS().catch(() => {});
+
+    const data = await gql(
+      `query($cardId: ID!) {
+        card(id: $cardId) {
+          id title assignees { name }
+          current_phase { id name }
+          fields { name value report_value field { id internal_id } }
+        }
+      }`,
+      { cardId }
+    );
+
     const card = data.card;
     const f = card.fields || [];
 
-    // Opcional: garantir que estamos na fase Proposta
-    // const currentPhaseId = card.current_phase?.id;
-    // if (currentPhaseId !== PHASE_ID_PROPOSTA) return res.status(200).json({ ok: true, message: 'Fora da fase Proposta' });
+    // Habilite a linha abaixo se quiser limitar à fase Proposta
+    // if (String(card.current_phase?.id) !== String(PHASE_ID_PROPOSTA)) {
+    //   return res.status(200).json({ ok: true, message: 'Fora da fase Proposta' });
+    // }
 
     const disparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
     if (!disparo) return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
@@ -171,23 +271,44 @@ app.post('/pipefy', async (req, res) => {
     const dados = montarDados(card);
     const add = montarADD(dados);
     const signers = montarSigners(dados);
-
     const cofreUuid = COFRES_UUIDS[dados.vendedor];
+
     if (!cofreUuid) throw new Error(`Cofre não configurado para vendedor: ${dados.vendedor}`);
 
-    const d4uuid = await criarDocumentoD4(D4SIGN_TOKEN, D4SIGN_CRYPT_KEY, TEMPLATE_UUID_CONTRATO, card.title, add, signers, cofreUuid);
+    const d4uuid = await criarDocumentoD4(
+      D4SIGN_TOKEN, D4SIGN_CRYPT_KEY,
+      TEMPLATE_UUID_CONTRATO, card.title,
+      add, signers, cofreUuid
+    );
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
-    await gql(SET_FIELD_Q, { input: { card_id: card.id, field_id: FIELD_ID_LINKS_D4, value: link } });
-    await gql(MOVE_CARD_Q, { input: { card_id: card.id, destination_phase_id: PHASE_ID_CONTRATO_ENVIADO } });
+    await gql(
+      `mutation($input: SetFieldValueInput!) {
+        setFieldValue(input: $input) { card { id } }
+      }`,
+      { input: { card_id: card.id, field_id: FIELD_ID_LINKS_D4, value: link } }
+    );
 
+    await gql(
+      `mutation($input: MoveCardToPhaseInput!) {
+        moveCardToPhase(input: $input) { card { id current_phase { id name } } }
+      }`,
+      { input: { card_id: card.id, destination_phase_id: PHASE_ID_CONTRATO_ENVIADO } }
+    );
+
+    console.log(`[SUCESSO] Documento ${card.title} enviado para D4Sign com UUID ${d4uuid}`);
     return res.json({ ok: true, d4uuid });
+
   } catch (e) {
-    console.error(e);
-    return res.status(502).json({ error: e.message });
+    console.error('[ERRO PIPEFY-D4SIGN]', e.code || e.message || e);
+    return res.status(502).json({ error: e.code || e.message || 'Erro desconhecido' });
   }
 });
 
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+// ============================================================================
+// START
+// ============================================================================
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+  preflightDNS().catch(() => {});
+});
