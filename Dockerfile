@@ -4,10 +4,11 @@ FROM node:18-bullseye
 # Diretório de trabalho dentro do container
 WORKDIR /app
 
-# Pacotes úteis para debug e HTTPS
-RUN apt-get update \
-  && apt-get install -y bash curl iputils-ping ca-certificates libcurl4-openssl-dev \
-  && rm -rf /var/lib/apt/lists/*
+# Usa Debian e instala suporte HTTPS completo
+RUN apt-get update && \
+    apt-get install -y bash curl iputils-ping ca-certificates libcurl4-openssl-dev && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 # Dependências do Node
 COPY package*.json ./
