@@ -61,7 +61,7 @@ const COFRES_UUIDS = {
 // ============================================================================
 
 async function preflightDNS() {
-  const hosts = ['api.pipefy.com', 'api.d4sign.com.br', 'secure.d4sign.com.br', 'google.com'];
+  const hosts = ['api.pipefy.com', 'secure.d4sign.com.br', 'google.com'];
   for (const host of hosts) {
     try {
       const { address } = await dns.lookup(host, { family: 4 });
@@ -113,7 +113,7 @@ async function fetchWithRetry(url, options = {}, {
       if (!transient || isLast) {
         throw e;
       }
-      const delay = baseDelayMs * Math.pow(2, i - 1); // backoff exponencial
+      const delay = baseDelayMs * Math.pow(2, i - 1);
       await sleep(delay);
     }
   }
@@ -187,7 +187,7 @@ function montarSigners(d) {
 // D4SIGN
 // ============================================================================
 async function criarDocumentoD4(token, cryptKey, uuidTemplate, title, add, signers, cofreUuid) {
-  const url = `https://api.d4sign.com.br/api/v1/documents/${uuidTemplate}/templates`;
+  const url = `https://secure.d4sign.com.br/api/v1/documents/${uuidTemplate}/templates`;
 
   const body = {
     uuid_safe: token,
@@ -242,7 +242,6 @@ app.post('/pipefy', async (req, res) => {
   if (!cardId) return res.status(400).json({ error: 'Sem cardId' });
 
   try {
-    // Preflight rápido (não bloqueia o fluxo)
     preflightDNS().catch(() => {});
 
     const data = await gql(
@@ -258,11 +257,6 @@ app.post('/pipefy', async (req, res) => {
 
     const card = data.card;
     const f = card.fields || [];
-
-    // Habilite a linha abaixo se quiser limitar à fase Proposta
-    // if (String(card.current_phase?.id) !== String(PHASE_ID_PROPOSTA)) {
-    //   return res.status(200).json({ ok: true, message: 'Fora da fase Proposta' });
-    // }
 
     const disparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
     if (!disparo) return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
