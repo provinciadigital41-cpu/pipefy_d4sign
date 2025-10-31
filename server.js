@@ -3,7 +3,7 @@
 // ============================================================================
 
 const express = require('express');
-const fetch = require('node-fetch');
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const dns = require('dns').promises;
 const http = require('http');
 const https = require('https');
