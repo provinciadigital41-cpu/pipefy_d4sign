@@ -1,7 +1,6 @@
 {
   "name": "pipefy-d4sign",
   "version": "1.0.0",
-  "type": "module",
   "main": "server.js",
   "license": "UNLICENSED",
   "dependencies": {
