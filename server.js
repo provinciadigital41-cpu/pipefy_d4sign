@@ -8,7 +8,6 @@ const dns = require('dns').promises;
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
-const { AbortController } = require('abort-controller');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
