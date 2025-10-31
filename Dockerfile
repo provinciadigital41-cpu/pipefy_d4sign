@@ -4,8 +4,10 @@ FROM node:18-bullseye
 # Define o diretório de trabalho
 WORKDIR /app
 
-# Instala utilitários básicos
-RUN apt-get update && apt-get install -y bash curl iputils-ping && rm -rf /var/lib/apt/lists/*
+# Instala bash, curl, ping e suporte HTTPS completo
+RUN apt-get update && \
+    apt-get install -y bash curl iputils-ping ca-certificates libcurl4-openssl-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copia os arquivos de dependências
 COPY package*.json ./
