@@ -14,8 +14,12 @@ RUN npm install
 # Copia o código da aplicação
 COPY . .
 
+RUN chmod +x ./entrypoint.sh
+
 # Expõe a porta padrão da aplicação
 EXPOSE 3000
+
+ENTRYPOINT ["./entrypoint.sh"]
 
 # Define DNS preferencial via variável (modo compatível com Hostinger)
 ENV DNS_SERVERS="1.1.1.1 8.8.8.8"
