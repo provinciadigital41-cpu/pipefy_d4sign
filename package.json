@@ -2,6 +2,7 @@
   "name": "pipefy-d4sign",
   "version": "1.0.0",
   "main": "server.js",
+  "type": "commonjs",
   "license": "UNLICENSED",
   "dependencies": {
     "express": "^4.19.2",
