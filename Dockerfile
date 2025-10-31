@@ -1,27 +1,30 @@
-# Usa imagem Debian, mais estável para rede e build
+# Base Debian estável, compatível com HTTPS e ferramentas de rede
 FROM node:18-bullseye
 
-# Define o diretório de trabalho
+# Diretório de trabalho dentro do container
 WORKDIR /app
 
-# Instala bash, curl, ping e suporte HTTPS completo
-RUN apt-get update && \
-    apt-get install -y bash curl iputils-ping ca-certificates libcurl4-openssl-dev && \
-    rm -rf /var/lib/apt/lists/*
+# Pacotes úteis para debug e HTTPS
+RUN apt-get update \
+  && apt-get install -y bash curl iputils-ping ca-certificates libcurl4-openssl-dev \
+  && rm -rf /var/lib/apt/lists/*
 
-# Copia os arquivos de dependências
+# Dependências do Node
 COPY package*.json ./
-RUN npm install
+# usa npm ci se existir package-lock, senão cai para npm install
+RUN npm ci --only=production || npm install --production
 
-# Copia o código da aplicação
-COPY entrypoint.sh .
+# Copia o restante do projeto
+COPY . .
 
+# Garante permissão de execução do entrypoint
 RUN chmod +x ./entrypoint.sh
 
-# Expõe a porta padrão da aplicação
+# Porta interna da aplicação
 EXPOSE 3000
 
+# Executa o seu entrypoint que ajusta o DNS e chama o CMD
 ENTRYPOINT ["./entrypoint.sh"]
 
-# Apenas define o comando principal
+# Comando principal da aplicação
 CMD ["node", "server.js"]
