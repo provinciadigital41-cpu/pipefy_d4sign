@@ -21,8 +21,5 @@ EXPOSE 3000
 
 ENTRYPOINT ["./entrypoint.sh"]
 
-# Define DNS preferencial via variável (modo compatível com Hostinger)
-ENV DNS_SERVERS="1.1.1.1 8.8.8.8"
-
-# Inicia o app Node
-CMD echo 'nameserver 1.1.1.1\nnameserver 8.8.8.8' > /etc/resolv.conf 2>/dev/null || true && node server.js
+# Apenas define o comando principal
+CMD ["node", "server.js"]
