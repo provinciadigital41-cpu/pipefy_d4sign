@@ -31,3 +31,12 @@ ENTRYPOINT ["./entrypoint.sh"]
 
 # Comando principal da aplicação
 CMD ["node", "server.js"]
+
+# Porta interna da aplicação
+EXPOSE 3000
+
+# Executa o seu entrypoint que ajusta o DNS e chama o CMD
+ENTRYPOINT ["./entrypoint.sh"]
+
+# Comando principal da aplicação
+CMD ["node", "server.js"]
