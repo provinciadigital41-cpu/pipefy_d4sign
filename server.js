@@ -69,12 +69,11 @@ const COFRES_UUIDS = {
 // Idempotência: lock por card enquanto processa (evita duplicados no mesmo clique)
 // ============================================================================
 const inFlight = new Set();
-const LOCK_RELEASE_MS = 30_000; // janela curta; só previne duplicados simultâneos
+const LOCK_RELEASE_MS = 30_000;
 
 function acquireLock(key) {
   if (inFlight.has(key)) return false;
   inFlight.add(key);
-  // segurança: libera lock caso algo dê muito errado
   setTimeout(() => inFlight.delete(key), LOCK_RELEASE_MS).unref?.();
   return true;
 }
@@ -162,29 +161,25 @@ async function gql(query, vars) {
   return json.data;
 }
 
-// Atualiza campo do card de forma compatível com schemas diferentes
-async function setCardFieldValue(cardId, fieldId, value) {
-  const q1 = `
+// Helpers tipados para o Pipefy (evita type mismatch)
+async function setCardFieldText(cardId, fieldId, text) {
+  const q = `
     mutation($input: UpdateCardFieldInput!) {
       updateCardField(input: $input) { card { id } }
     }
   `;
-  const v1 = { input: { card_id: cardId, field_id: fieldId, new_value: String(value) } };
+  const vars = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: String(text) } } };
+  await gql(q, vars);
+}
 
-  try {
-    await gql(q1, v1);
-    return;
-  } catch (e1) {
-    const q2 = `
-      mutation($card_id: ID!, $field_id: String!, $value: String!) {
-        updateCardField(input: { card_id: $card_id, field_id: $field_id, new_value: $value }) {
-          card { id }
-        }
-      }
-    `;
-    const v2 = { card_id: cardId, field_id: fieldId, value: String(value) };
-    await gql(q2, v2);
-  }
+async function setCardFieldBoolean(cardId, fieldId, bool) {
+  const q = `
+    mutation($input: UpdateCardFieldInput!) {
+      updateCardField(input: $input) { card { id } }
+    }
+  `;
+  const vars = { input: { card_id: cardId, field_id: fieldId, new_value: { boolean_value: !!bool } } };
+  await gql(q, vars);
 }
 
 async function moveCardToPhaseSafe(card, destPhaseId) {
@@ -353,7 +348,20 @@ app.post('/pipefy', async (req, res) => {
     }
 
     // A cada marcação (true) sempre gera UM contrato novo
-    const dados = montarDados(card);
+    const dados = (function montarDadosLocal() {
+      const ff = card.fields || [];
+      return {
+        nome: getField(ff, 'nome_do_contato'),
+        email: getField(ff, 'email_profissional'),
+        telefone: getField(ff, 'telefone'),
+        cnpj: getField(ff, 'cpf_cnpj'),
+        servicos: getField(ff, 'servi_os_de_contratos') || '',
+        valor: getField(ff, 'valor_do_neg_cio') || '',
+        parcelas: getField(ff, 'quantidade_de_parcelas') || '1',
+        vendedor: card.assignees?.[0]?.name || 'Desconhecido'
+      };
+    })();
+
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
     const uuidSafe = COFRES_UUIDS[dados.vendedor];
@@ -372,11 +380,11 @@ app.post('/pipefy', async (req, res) => {
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
 
-    // grava o link no card
-    await setCardFieldValue(card.id, FIELD_ID_LINKS_D4, link);
+    // grava o link (campo texto)
+    await setCardFieldText(card.id, FIELD_ID_LINKS_D4, link);
 
-    // desmarca o checkbox para permitir um novo teste quando marcar de novo
-    await setCardFieldValue(card.id, FIELD_ID_CHECKBOX_DISPARO, 'false');
+    // desmarca o checkbox com booleano false (evita erro "Options: Sim")
+    await setCardFieldBoolean(card.id, FIELD_ID_CHECKBOX_DISPARO, false);
 
     // move de fase com tolerância
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
@@ -388,7 +396,6 @@ app.post('/pipefy', async (req, res) => {
   } catch (e) {
     console.error('[ERRO PIPEFY-D4SIGN]', e.code || e.message || e);
     releaseLock(lockKey);
-    // devolvemos 200 para evitar retries em cascata do origin
     return res.status(200).json({ ok: false, error: e.code || e.message || 'Erro desconhecido' });
   }
 });
