@@ -23,11 +23,17 @@ const {
   PORT = 3000,
   PIPE_API_KEY,
   PIPE_GRAPHQL_ENDPOINT = 'https://api.pipefy.com/graphql',
+
+  // D4Sign
   D4SIGN_CRYPT_KEY,
-  D4SIGN_TOKEN,
-  TEMPLATE_UUID_CONTRATO,
+  D4SIGN_TOKEN, // tokenAPI
+  TEMPLATE_UUID_CONTRATO, // UUID do template configurado no painel da D4Sign
+
+  // Pipefy
   PHASE_ID_PROPOSTA,
   PHASE_ID_CONTRATO_ENVIADO,
+
+  // Cofres por vendedor (uuid do SAFE)
   COFRE_UUID_EDNA,
   COFRE_UUID_GREYCE,
   COFRE_UUID_MARIANA,
@@ -59,7 +65,6 @@ const COFRES_UUIDS = {
 // ============================================================================
 // HELPERS: DNS preflight + fetch com retry/backoff/timeout
 // ============================================================================
-
 async function preflightDNS() {
   const hosts = ['api.pipefy.com', 'secure.d4sign.com.br', 'google.com'];
   for (const host of hosts) {
@@ -83,7 +88,6 @@ async function fetchWithRetry(url, options = {}, {
   baseDelayMs = 400,
   timeoutMs = 15000
 } = {}) {
-
   let lastErr;
   for (let i = 1; i <= attempts; i++) {
     const u = new URL(url);
@@ -186,34 +190,26 @@ function montarSigners(d) {
 // ============================================================================
 // D4SIGN
 // ============================================================================
-async function criarDocumentoD4(token, cryptKey, uuidTemplate, title, add, signers, cofreUuid) {
-  const url = `https://secure.d4sign.com.br/api/v1/documents/${uuidTemplate}/templates`;
+async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, uuidTemplate, title, add, signers) {
+  const base = 'https://secure.d4sign.com.br';
+  const url = new URL(`/api/v1/documents/${uuidSafe}/makedocumentbytemplateword`, base);
+  url.searchParams.set('tokenAPI', tokenAPI);
+  url.searchParams.set('cryptKey', cryptKey);
 
   const body = {
-    uuid_safe: token,
-    uuid_cofre: cofreUuid,
-    templates: [{
-      title,
-      email_signer: false,
-      workflow: 0,
-      block_physical: 1,
-      block_sms: 0,
-      skip_email: 0,
-      block_foreign: 0,
-      block_ip: 0,
-      signers,
-      add
-    }]
+    name_document: title,
+    id_template: [uuidTemplate],
+    ADD: add,
+    signers
+    // Se precisar, você pode incluir: uuid_folder, skip_email, workflow, etc
   };
 
-  console.log(`[D4SIGN] POST ${url}`);
-  const res = await fetchWithRetry(url, {
+  console.log(`[D4SIGN] POST ${url.toString()}`);
+  const res = await fetchWithRetry(url.toString(), {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'tokenAPI': token,
-      'cryptKey': cryptKey
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify(body)
   }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
@@ -222,13 +218,13 @@ async function criarDocumentoD4(token, cryptKey, uuidTemplate, title, add, signe
   let data;
   try { data = JSON.parse(text); } catch { data = null; }
 
-  if (!res.ok || !Array.isArray(data) || !data[0]?.uuid_document) {
+  if (!res.ok || !data || !data.uuid_document) {
     console.error(`[ERRO D4SIGN] HTTP ${res.status} → ${text}`);
     throw new Error(`Falha D4Sign: ${res.status}`);
   }
 
-  console.log(`[D4SIGN] OK uuid=${data[0].uuid_document}`);
-  return data[0].uuid_document;
+  console.log(`[D4SIGN] OK uuid=${data.uuid_document}`);
+  return data.uuid_document;
 }
 
 // ============================================================================
@@ -264,14 +260,18 @@ app.post('/pipefy', async (req, res) => {
     const dados = montarDados(card);
     const add = montarADD(dados);
     const signers = montarSigners(dados);
-    const cofreUuid = COFRES_UUIDS[dados.vendedor];
+    const uuidSafe = COFRES_UUIDS[dados.vendedor];
 
-    if (!cofreUuid) throw new Error(`Cofre não configurado para vendedor: ${dados.vendedor}`);
+    if (!uuidSafe) throw new Error(`Cofre não configurado para vendedor: ${dados.vendedor}`);
 
     const d4uuid = await criarDocumentoD4(
-      D4SIGN_TOKEN, D4SIGN_CRYPT_KEY,
-      TEMPLATE_UUID_CONTRATO, card.title,
-      add, signers, cofreUuid
+      D4SIGN_TOKEN,           // tokenAPI
+      D4SIGN_CRYPT_KEY,       // cryptKey
+      uuidSafe,               // UUID do SAFE
+      TEMPLATE_UUID_CONTRATO, // UUID do template
+      card.title,
+      add,
+      signers
     );
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
