@@ -145,6 +145,31 @@ async function gql(query, vars) {
   return json.data;
 }
 
+// Atualiza campo do card de forma compatível com o schema atual
+async function setCardFieldValue(cardId, fieldId, value) {
+  const q1 = `
+    mutation($input: UpdateCardFieldInput!) {
+      updateCardField(input: $input) { card { id } }
+    }
+  `;
+  const v1 = { input: { card_id: cardId, field_id: fieldId, new_value: String(value) } };
+
+  try {
+    await gql(q1, v1);
+    return;
+  } catch (e1) {
+    const q2 = `
+      mutation($card_id: ID!, $field_id: String!, $value: String!) {
+        updateCardField(input: { card_id: $card_id, field_id: $field_id, new_value: $value }) {
+          card { id }
+        }
+      }
+    `;
+    const v2 = { card_id: cardId, field_id: fieldId, value: String(value) };
+    await gql(q2, v2);
+  }
+}
+
 function getField(fields, id) {
   const f = fields.find(x => x.field.id === id || x.field.internal_id === id);
   return f ? (f.value ?? f.report_value ?? null) : null;
@@ -170,11 +195,8 @@ function montarADDWord(d) {
     contratante_1: d.nome || '',
     dados_para_contato: `${d.email || ''} / ${d.telefone || ''}`,
     numero_de_parcelas_da_assessoria: String(d.parcelas || '1'),
-    valor_da_parcela_da_assessoria: String(d.valor || ''),
-    // ajuste/complete abaixo quando tiver mais campos do Pipefy:
-    // forma_de_pagamento_da_assessoria: '',
-    // data_de_pagamento_da_assessoria: '',
-    // cidade: '', uf: '', dia: '', mes: '', ano: ''
+    valor_da_parcela_da_assessoria: String(d.valor || '')
+    // complete aqui conforme precisar: forma_de_pagamento_da_assessoria, cidade, uf, etc
   };
 }
 
@@ -182,12 +204,11 @@ function montarSigners(d) {
   return [{
     email: d.email,
     name: d.nome,
-    act: "1",            
-    foreign: "0",        
-    send_email: "1"      
+    act: '1',         // autenticação por email
+    foreign: '0',     // 0 = brasileiro
+    send_email: '1'   // dispara email de assinatura
   }];
 }
-
 
 // ============================================================================
 // D4SIGN – WORD (formato que funcionou no seu teste: templates{ <id>: {vars} })
@@ -201,7 +222,7 @@ async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId,
   const body = {
     name_document: title,
     templates: {
-      [templateId]: varsObj // <- exatamente o formato que retornou 200 no seu teste C
+      [templateId]: varsObj
     }
   };
 
@@ -227,13 +248,12 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
   url.searchParams.set('tokenAPI', tokenAPI);
   url.searchParams.set('cryptKey', cryptKey);
 
-  // Garante que todo signer tenha os campos mínimos exigidos
   const signersPayload = signers.map(s => ({
     email: s.email,
     name: s.name,
-    act: s.act || "1",
-    foreign: s.foreign || "0",
-    send_email: s.send_email || "1"
+    act: s.act || '1',
+    foreign: s.foreign || '0',
+    send_email: s.send_email || '1'
   }));
 
   const body = { signers: signersPayload };
@@ -299,20 +319,18 @@ app.post('/pipefy', async (req, res) => {
       D4SIGN_TOKEN,           // tokenAPI
       D4SIGN_CRYPT_KEY,       // cryptKey
       uuidSafe,               // UUID do SAFE
-      TEMPLATE_UUID_CONTRATO, // ID do template Word (ex.: "MTgwNjA4")
+      TEMPLATE_UUID_CONTRATO, // ID do template Word
       card.title,
       add,
       signers
     );
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
-    await gql(
-      `mutation($input: SetFieldValueInput!) {
-        setFieldValue(input: $input) { card { id } }
-      }`,
-      { input: { card_id: card.id, field_id: FIELD_ID_LINKS_D4, value: link } }
-    );
 
+    // Atualiza campo do card com o link do D4Sign
+    await setCardFieldValue(card.id, FIELD_ID_LINKS_D4, link);
+
+    // Move o card de fase
     await gql(
       `mutation($input: MoveCardToPhaseInput!) {
         moveCardToPhase(input: $input) { card { id current_phase { id name } } }
