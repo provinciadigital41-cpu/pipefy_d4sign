@@ -27,7 +27,7 @@ const {
   // D4Sign
   D4SIGN_CRYPT_KEY,          // cryptKey
   D4SIGN_TOKEN,              // tokenAPI
-  TEMPLATE_UUID_CONTRATO,    // ID do template Word
+  TEMPLATE_UUID_CONTRATO,    // ID do template Word (ex.: "MTgwNjA4")
 
   // Pipefy
   PHASE_ID_PROPOSTA,
@@ -164,29 +164,27 @@ function montarDados(card) {
   };
 }
 
-function montarADD(d) {
+// mapeia dados do Pipefy → tokens snake_case do seu template Word
+function montarADDWord(d) {
   return {
-    'Contratante 1': d.nome,
-    'Dados para contato': `${d.email} / ${d.telefone}`,
-    'CNPJ/CPF': d.cnpj,
-    'Valor da Assessoria': d.valor,
-    'Número de parcelas da Assessoria': d.parcelas,
-    'Vendedor': d.vendedor
+    contratante_1: d.nome || '',
+    dados_para_contato: `${d.email || ''} / ${d.telefone || ''}`,
+    numero_de_parcelas_da_assessoria: String(d.parcelas || '1'),
+    valor_da_parcela_da_assessoria: String(d.valor || ''),
+    // ajuste/complete abaixo quando tiver mais campos do Pipefy:
+    // forma_de_pagamento_da_assessoria: '',
+    // data_de_pagamento_da_assessoria: '',
+    // cidade: '', uf: '', dia: '', mes: '', ano: ''
   };
 }
 
-// Signers mínimos para começar
 function montarSigners(d) {
-  return [{
-    email: d.email,
-    name: d.nome
-  }];
+  return [{ email: d.email, name: d.nome }];
 }
 
 // ============================================================================
-// D4SIGN – WORD TEMPLATE
+// D4SIGN – WORD (formato que funcionou no seu teste: templates{ <id>: {vars} })
 // ============================================================================
-
 async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, varsObj) {
   const base = 'https://secure.d4sign.com.br';
   const url = new URL(`/api/v1/documents/${uuidSafe}/makedocumentbytemplateword`, base);
@@ -195,8 +193,9 @@ async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId,
 
   const body = {
     name_document: title,
-    id_template: [templateId],
-    ADD: varsObj
+    templates: {
+      [templateId]: varsObj // <- exatamente o formato que retornou 200 no seu teste C
+    }
   };
 
   const res = await fetchWithRetry(url.toString(), {
@@ -205,15 +204,16 @@ async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId,
     body: JSON.stringify(body)
   }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
 
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || !(json.uuid || json.uuid_document)) {
-    console.error('[ERRO D4SIGN WORD]', res.status, json);
+  const text = await res.text();
+  let json; try { json = JSON.parse(text); } catch { json = null; }
+
+  if (!res.ok || !(json && (json.uuid || json.uuid_document))) {
+    console.error('[ERRO D4SIGN WORD]', res.status, text);
     throw new Error(`Falha D4Sign(WORD): ${res.status}`);
   }
   return json.uuid || json.uuid_document;
 }
 
-// Cadastra signatários após criar o documento
 async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
   const base = 'https://secure.d4sign.com.br';
   const url = new URL(`/api/v1/documents/${uuidDocument}/createlist`, base);
@@ -236,9 +236,8 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
   return text;
 }
 
-// Orquestração Word
-async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, templateId, title, addVars, signers) {
-  const uuidDoc = await makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, addVars);
+async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, templateId, title, varsObj, signers) {
+  const uuidDoc = await makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, varsObj);
   await cadastrarSignatarios(tokenAPI, cryptKey, uuidDoc, signers);
   return uuidDoc;
 }
@@ -274,7 +273,7 @@ app.post('/pipefy', async (req, res) => {
     if (!disparo) return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
 
     const dados = montarDados(card);
-    const add = montarADD(dados);
+    const add = montarADDWord(dados);
     const signers = montarSigners(dados);
     const uuidSafe = COFRES_UUIDS[dados.vendedor];
 
@@ -284,7 +283,7 @@ app.post('/pipefy', async (req, res) => {
       D4SIGN_TOKEN,           // tokenAPI
       D4SIGN_CRYPT_KEY,       // cryptKey
       uuidSafe,               // UUID do SAFE
-      TEMPLATE_UUID_CONTRATO, // ID do template (.docx)
+      TEMPLATE_UUID_CONTRATO, // ID do template Word (ex.: "MTgwNjA4")
       card.title,
       add,
       signers
