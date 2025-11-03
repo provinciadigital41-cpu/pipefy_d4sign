@@ -161,7 +161,7 @@ async function gql(query, vars) {
   return json.data;
 }
 
-// Helpers tipados para o Pipefy (evita type mismatch)
+// Helpers tipados para o Pipefy
 async function setCardFieldText(cardId, fieldId, text) {
   const q = `
     mutation($input: UpdateCardFieldInput!) {
@@ -172,14 +172,26 @@ async function setCardFieldText(cardId, fieldId, text) {
   await gql(q, vars);
 }
 
-async function setCardFieldBoolean(cardId, fieldId, bool) {
-  const q = `
+// Seta ou limpa campo select. label = "Sim" para marcar, null para limpar.
+async function setCardFieldOption(cardId, fieldId, label) {
+  const qA = `
     mutation($input: UpdateCardFieldInput!) {
       updateCardField(input: $input) { card { id } }
     }
   `;
-  const vars = { input: { card_id: cardId, field_id: fieldId, new_value: { boolean_value: !!bool } } };
-  await gql(q, vars);
+  const vA = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: label ? String(label) : "" } } };
+  try {
+    await gql(qA, vA);
+    return;
+  } catch (eA) {
+    const qB = `
+      mutation($input: UpdateCardFieldInput!) {
+        updateCardField(input: $input) { card { id } }
+      }
+    `;
+    const vB = { input: { card_id: cardId, field_id: fieldId, new_value: { array_value: label ? [String(label)] : [] } } };
+    await gql(qB, vB);
+  }
 }
 
 async function moveCardToPhaseSafe(card, destPhaseId) {
@@ -236,7 +248,7 @@ function montarSigners(d) {
     name: d.nome,
     act: '1',       // email
     foreign: '0',   // brasileiro
-    send_email: '1' // dispara e mail
+    send_email: '1' // dispara email
   }];
 }
 
@@ -316,7 +328,7 @@ app.post('/pipefy', async (req, res) => {
   const cardId = req.body?.data?.action?.card?.id;
   if (!cardId) return res.status(400).json({ error: 'Sem cardId' });
 
-  // lock por card para evitar múltiplas execuções no MESMO clique
+  // lock por card para evitar múltiplas execuções no mesmo clique
   const lockKey = `card:${cardId}`;
   if (!acquireLock(lockKey)) {
     return res.status(200).json({ ok: true, message: 'Processamento em andamento' });
@@ -347,21 +359,8 @@ app.post('/pipefy', async (req, res) => {
       return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
     }
 
-    // A cada marcação (true) sempre gera UM contrato novo
-    const dados = (function montarDadosLocal() {
-      const ff = card.fields || [];
-      return {
-        nome: getField(ff, 'nome_do_contato'),
-        email: getField(ff, 'email_profissional'),
-        telefone: getField(ff, 'telefone'),
-        cnpj: getField(ff, 'cpf_cnpj'),
-        servicos: getField(ff, 'servi_os_de_contratos') || '',
-        valor: getField(ff, 'valor_do_neg_cio') || '',
-        parcelas: getField(ff, 'quantidade_de_parcelas') || '1',
-        vendedor: card.assignees?.[0]?.name || 'Desconhecido'
-      };
-    })();
-
+    // Cada marcação gera exatamente um documento
+    const dados = montarDados(card);
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
     const uuidSafe = COFRES_UUIDS[dados.vendedor];
@@ -369,10 +368,10 @@ app.post('/pipefy', async (req, res) => {
     if (!uuidSafe) throw new Error(`Cofre não configurado para vendedor: ${dados.vendedor}`);
 
     const d4uuid = await criarDocumentoD4(
-      D4SIGN_TOKEN,           // tokenAPI
-      D4SIGN_CRYPT_KEY,       // cryptKey
-      uuidSafe,               // UUID do SAFE
-      TEMPLATE_UUID_CONTRATO, // ID do template Word
+      D4SIGN_TOKEN,
+      D4SIGN_CRYPT_KEY,
+      uuidSafe,
+      TEMPLATE_UUID_CONTRATO,
       card.title,
       add,
       signers
@@ -380,11 +379,11 @@ app.post('/pipefy', async (req, res) => {
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
 
-    // grava o link (campo texto)
+    // grava o link no card
     await setCardFieldText(card.id, FIELD_ID_LINKS_D4, link);
 
-    // desmarca o checkbox com booleano false (evita erro "Options: Sim")
-    await setCardFieldBoolean(card.id, FIELD_ID_CHECKBOX_DISPARO, false);
+    // limpa o campo "gerar_contrato" (select) para permitir marcar novamente depois
+    await setCardFieldOption(card.id, FIELD_ID_CHECKBOX_DISPARO, null);
 
     // move de fase com tolerância
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
