@@ -1,5 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries, DNS e idempotência por marcação)
+// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries, DNS e edge-trigger por marcação)
 // ============================================================================
 
 const express = require('express');
@@ -46,7 +46,7 @@ const {
   COFRE_UUID_MAURO,
 } = process.env;
 
-const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato';
+const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato'; // select com opção "Sim"
 const FIELD_ID_LINKS_D4 = 'd4_contrato';
 
 // ============================================================================
@@ -170,30 +170,6 @@ async function setCardFieldText(cardId, fieldId, text) {
   `;
   const vars = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: String(text) } } };
   await gql(q, vars);
-}
-
-// Limpa valor do campo via deleteCardFieldValue (necessário para "desmarcar" checkbox/select)
-async function clearCardFieldValue(cardId, fieldId) {
-  // Variante principal: deleteCardFieldValue
-  const q = `
-    mutation($input: DeleteCardFieldValueInput!) {
-      deleteCardFieldValue(input: $input) { success }
-    }
-  `;
-  const vars = { input: { card_id: cardId, field_id: fieldId } };
-  try {
-    await gql(q, vars);
-    return;
-  } catch (e) {
-    // Fallback: tenta setar para array vazio (alguns workspaces aceitam)
-    const q2 = `
-      mutation($input: UpdateCardFieldInput!) {
-        updateCardField(input: $input) { card { id } }
-      }
-    `;
-    const v2 = { input: { card_id: cardId, field_id: fieldId, new_value: { array_value: [] } } };
-    await gql(q2, v2);
-  }
 }
 
 async function moveCardToPhaseSafe(card, destPhaseId) {
@@ -321,6 +297,39 @@ async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, templateId, title,
 }
 
 // ============================================================================
+// EDGE-TRIGGER: só roda quando o webhook indica que "gerar_contrato" foi marcado agora
+// ============================================================================
+function wasJustMarked(reqBody) {
+  // Diferentes formatos de webhook do Pipefy:
+  // 1) action.field: { id, value, previous_value }
+  const f1 = reqBody?.data?.action?.field;
+  if (f1 && (f1.id === FIELD_ID_CHECKBOX_DISPARO || f1.internal_id === FIELD_ID_CHECKBOX_DISPARO)) {
+    const prev = (f1.previous_value ?? '').toString().toLowerCase();
+    const now  = (f1.value ?? '').toString().toLowerCase();
+    // Considera marcado quando mudou para "sim"
+    if (now === 'sim' && prev !== 'sim') return true;
+  }
+
+  // 2) action.fields: array de mudanças
+  const arr = reqBody?.data?.action?.fields;
+  if (Array.isArray(arr)) {
+    for (const itm of arr) {
+      const idok = itm?.field?.id === FIELD_ID_CHECKBOX_DISPARO || itm?.field?.internal_id === FIELD_ID_CHECKBOX_DISPARO;
+      if (!idok) continue;
+      const prev = (itm.previous_value ?? '').toString().toLowerCase();
+      const now  = (itm.value ?? '').toString().toLowerCase();
+      if (now === 'sim' && prev !== 'sim') return true;
+    }
+  }
+
+  // 3) fallback: se o webhook indicar explicitamente o nome do campo e new_value
+  const maybe = reqBody?.data?.action?.name === FIELD_ID_CHECKBOX_DISPARO && String(reqBody?.data?.action?.new_value || '').toLowerCase() === 'sim';
+  if (maybe) return true;
+
+  return false;
+}
+
+// ============================================================================
 // ROTAS
 // ============================================================================
 app.get('/', (req, res) => res.send('Servidor ativo e rodando'));
@@ -330,7 +339,12 @@ app.post('/pipefy', async (req, res) => {
   const cardId = req.body?.data?.action?.card?.id;
   if (!cardId) return res.status(400).json({ error: 'Sem cardId' });
 
-  // lock por card para evitar múltiplas execuções no mesmo clique
+  // edge-trigger: só processa se acabou de marcar o campo
+  if (!wasJustMarked(req.body)) {
+    return res.status(200).json({ ok: true, message: 'Evento ignorado (sem transição para "Sim")' });
+  }
+
+  // lock por card para evitar múltiplas execuções no MESMO clique
   const lockKey = `card:${cardId}`;
   if (!acquireLock(lockKey)) {
     return res.status(200).json({ ok: true, message: 'Processamento em andamento' });
@@ -351,17 +365,8 @@ app.post('/pipefy', async (req, res) => {
     );
 
     const card = data.card;
-    const f = card.fields || [];
 
-    const disparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
-
-    // Se checkbox não está marcado, não faz nada
-    if (!disparo) {
-      releaseLock(lockKey);
-      return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
-    }
-
-    // Cada marcação gera exatamente um documento
+    // monta dados, gera documento, cadastra signatários
     const dados = montarDados(card);
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
@@ -383,9 +388,6 @@ app.post('/pipefy', async (req, res) => {
 
     // grava o link no card
     await setCardFieldText(card.id, FIELD_ID_LINKS_D4, link);
-
-    // limpa o campo "gerar_contrato" para permitir marcar novamente depois
-    await clearCardFieldValue(card.id, FIELD_ID_CHECKBOX_DISPARO);
 
     // move de fase com tolerância
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
