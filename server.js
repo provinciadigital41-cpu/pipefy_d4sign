@@ -1,5 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries e DNS preflight)
+// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries, DNS e idempotência)
 // ============================================================================
 
 const express = require('express');
@@ -63,6 +63,21 @@ const COFRES_UUIDS = {
 };
 
 // ============================================================================
+// Idempotência: cache em memória para evitar reentradas em curto intervalo
+// ============================================================================
+const inFlight = new Map(); // key -> expiresAt
+const IDEMP_TTL_MS = 120_000;
+
+function beginOnce(key, ttlMs = IDEMP_TTL_MS) {
+  const now = Date.now();
+  const exp = inFlight.get(key);
+  if (exp && exp > now) return false; // já em processamento
+  inFlight.set(key, now + ttlMs);
+  return true;
+}
+function endOnce(key) { inFlight.delete(key); }
+
+// ============================================================================
 // HELPERS: DNS preflight + fetch com retry/backoff/timeout
 // ============================================================================
 async function preflightDNS() {
@@ -114,9 +129,8 @@ async function fetchWithRetry(url, options = {}, {
 
       console.warn(`[HTTP-RETRY] ${u.host} tentativa ${i}/${attempts} → ${code || e.message}`);
 
-      if (!transient || isLast) {
-        throw e;
-      }
+      if (!transient || isLast) throw e;
+
       const delay = baseDelayMs * Math.pow(2, i - 1);
       await sleep(delay);
     }
@@ -170,6 +184,25 @@ async function setCardFieldValue(cardId, fieldId, value) {
   }
 }
 
+async function moveCardToPhaseSafe(card, destPhaseId) {
+  if (card?.current_phase?.id === destPhaseId) return;
+
+  const q = `
+    mutation($input: MoveCardToPhaseInput!) {
+      moveCardToPhase(input: $input) { card { id current_phase { id name } } }
+    }
+  `;
+  const vars = { input: { card_id: card.id, destination_phase_id: destPhaseId } };
+
+  try {
+    await gql(q, vars);
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (msg.includes('The card is already in the destination phase')) return;
+    throw err;
+  }
+}
+
 function getField(fields, id) {
   const f = fields.find(x => x.field.id === id || x.field.internal_id === id);
   return f ? (f.value ?? f.report_value ?? null) : null;
@@ -185,18 +218,18 @@ function montarDados(card) {
     servicos: getField(f, 'servi_os_de_contratos') || '',
     valor: getField(f, 'valor_do_neg_cio') || '',
     parcelas: getField(f, 'quantidade_de_parcelas') || '1',
-    vendedor: card.assignees?.[0]?.name || 'Desconhecido'
+    vendedor: card.assignees?.[0]?.name || 'Desconhecido',
+    linkD4: getField(f, FIELD_ID_LINKS_D4)
   };
 }
 
-// mapeia dados do Pipefy → tokens snake_case do seu template Word
+// mapeia dados do Pipefy → tokens snake_case do template Word
 function montarADDWord(d) {
   return {
     contratante_1: d.nome || '',
     dados_para_contato: `${d.email || ''} / ${d.telefone || ''}`,
     numero_de_parcelas_da_assessoria: String(d.parcelas || '1'),
     valor_da_parcela_da_assessoria: String(d.valor || '')
-    // complete aqui conforme precisar: forma_de_pagamento_da_assessoria, cidade, uf, etc
   };
 }
 
@@ -204,14 +237,14 @@ function montarSigners(d) {
   return [{
     email: d.email,
     name: d.nome,
-    act: '1',         // autenticação por email
-    foreign: '0',     // 0 = brasileiro
-    send_email: '1'   // dispara email de assinatura
+    act: '1',       // email
+    foreign: '0',   // brasileiro
+    send_email: '1' // dispara e mail
   }];
 }
 
 // ============================================================================
-// D4SIGN – WORD (formato que funcionou no seu teste: templates{ <id>: {vars} })
+// D4SIGN – WORD (templates{ <id>: {vars} })
 // ============================================================================
 async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, varsObj) {
   const base = 'https://secure.d4sign.com.br';
@@ -221,9 +254,7 @@ async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId,
 
   const body = {
     name_document: title,
-    templates: {
-      [templateId]: varsObj
-    }
+    templates: { [templateId]: varsObj }
   };
 
   const res = await fetchWithRetry(url.toString(), {
@@ -288,6 +319,12 @@ app.post('/pipefy', async (req, res) => {
   const cardId = req.body?.data?.action?.card?.id;
   if (!cardId) return res.status(400).json({ error: 'Sem cardId' });
 
+  // chave de idempotência curta por card + template
+  const idemKey = `card:${cardId}:tpl:${TEMPLATE_UUID_CONTRATO}`;
+  if (!beginOnce(idemKey)) {
+    return res.status(200).json({ ok: true, message: 'Operação já em andamento' });
+  }
+
   try {
     preflightDNS().catch(() => {});
 
@@ -296,7 +333,7 @@ app.post('/pipefy', async (req, res) => {
         card(id: $cardId) {
           id title assignees { name }
           current_phase { id name }
-          fields { name value report_value field { id internal_id } }
+          fields { name value report_value field { id internal_id id } }
         }
       }`,
       { cardId }
@@ -306,9 +343,20 @@ app.post('/pipefy', async (req, res) => {
     const f = card.fields || [];
 
     const disparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
-    if (!disparo) return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
-
     const dados = montarDados(card);
+
+    // 1) se checkbox não marcado, não faz nada
+    if (!disparo) {
+      endOnce(idemKey);
+      return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
+    }
+
+    // 2) se já tem link D4 gravado, evita reprocessar
+    if (dados.linkD4) {
+      endOnce(idemKey);
+      return res.status(200).json({ ok: true, message: 'Contrato já gerado', link: dados.linkD4 });
+    }
+
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
     const uuidSafe = COFRES_UUIDS[dados.vendedor];
@@ -327,23 +375,24 @@ app.post('/pipefy', async (req, res) => {
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
 
-    // Atualiza campo do card com o link do D4Sign
+    // 3) grava o link no card
     await setCardFieldValue(card.id, FIELD_ID_LINKS_D4, link);
 
-    // Move o card de fase
-    await gql(
-      `mutation($input: MoveCardToPhaseInput!) {
-        moveCardToPhase(input: $input) { card { id current_phase { id name } } }
-      }`,
-      { input: { card_id: card.id, destination_phase_id: PHASE_ID_CONTRATO_ENVIADO } }
-    );
+    // 4) desmarca o checkbox (prevenção contra reruns futuros)
+    await setCardFieldValue(card.id, FIELD_ID_CHECKBOX_DISPARO, 'false');
+
+    // 5) move de fase com tolerância
+    await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
 
     console.log(`[SUCESSO] Documento ${card.title} enviado para D4Sign com UUID ${d4uuid}`);
-    return res.json({ ok: true, d4uuid });
+    endOnce(idemKey);
+    return res.json({ ok: true, d4uuid, link });
 
   } catch (e) {
     console.error('[ERRO PIPEFY-D4SIGN]', e.code || e.message || e);
-    return res.status(502).json({ error: e.code || e.message || 'Erro desconhecido' });
+    endOnce(idemKey);
+    // ainda devolvemos 200 para evitar múltiplos retries automáticos do origin
+    return res.status(200).json({ ok: false, error: e.code || e.message || 'Erro desconhecido' });
   }
 });
 
