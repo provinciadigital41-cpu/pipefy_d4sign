@@ -1,5 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries, DNS e idempotência)
+// PIPEFY + D4SIGN INTEGRAÇÃO - SERVER PRINCIPAL (com retries, DNS e idempotência por marcação)
 // ============================================================================
 
 const express = require('express');
@@ -49,6 +49,9 @@ const {
 const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato';
 const FIELD_ID_LINKS_D4 = 'd4_contrato';
 
+// ============================================================================
+// Cofres por vendedor
+// ============================================================================
 const COFRES_UUIDS = {
   'EDNA BERTO DA SILVA': COFRE_UUID_EDNA,
   'Greyce Maria Candido Souza': COFRE_UUID_GREYCE,
@@ -63,19 +66,19 @@ const COFRES_UUIDS = {
 };
 
 // ============================================================================
-// Idempotência: cache em memória para evitar reentradas em curto intervalo
+// Idempotência: lock por card enquanto processa (evita duplicados no mesmo clique)
 // ============================================================================
-const inFlight = new Map(); // key -> expiresAt
-const IDEMP_TTL_MS = 120_000;
+const inFlight = new Set();
+const LOCK_RELEASE_MS = 30_000; // janela curta; só previne duplicados simultâneos
 
-function beginOnce(key, ttlMs = IDEMP_TTL_MS) {
-  const now = Date.now();
-  const exp = inFlight.get(key);
-  if (exp && exp > now) return false; // já em processamento
-  inFlight.set(key, now + ttlMs);
+function acquireLock(key) {
+  if (inFlight.has(key)) return false;
+  inFlight.add(key);
+  // segurança: libera lock caso algo dê muito errado
+  setTimeout(() => inFlight.delete(key), LOCK_RELEASE_MS).unref?.();
   return true;
 }
-function endOnce(key) { inFlight.delete(key); }
+function releaseLock(key) { inFlight.delete(key); }
 
 // ============================================================================
 // HELPERS: DNS preflight + fetch com retry/backoff/timeout
@@ -159,7 +162,7 @@ async function gql(query, vars) {
   return json.data;
 }
 
-// Atualiza campo do card de forma compatível com o schema atual
+// Atualiza campo do card de forma compatível com schemas diferentes
 async function setCardFieldValue(cardId, fieldId, value) {
   const q1 = `
     mutation($input: UpdateCardFieldInput!) {
@@ -218,8 +221,7 @@ function montarDados(card) {
     servicos: getField(f, 'servi_os_de_contratos') || '',
     valor: getField(f, 'valor_do_neg_cio') || '',
     parcelas: getField(f, 'quantidade_de_parcelas') || '1',
-    vendedor: card.assignees?.[0]?.name || 'Desconhecido',
-    linkD4: getField(f, FIELD_ID_LINKS_D4)
+    vendedor: card.assignees?.[0]?.name || 'Desconhecido'
   };
 }
 
@@ -319,10 +321,10 @@ app.post('/pipefy', async (req, res) => {
   const cardId = req.body?.data?.action?.card?.id;
   if (!cardId) return res.status(400).json({ error: 'Sem cardId' });
 
-  // chave de idempotência curta por card + template
-  const idemKey = `card:${cardId}:tpl:${TEMPLATE_UUID_CONTRATO}`;
-  if (!beginOnce(idemKey)) {
-    return res.status(200).json({ ok: true, message: 'Operação já em andamento' });
+  // lock por card para evitar múltiplas execuções no MESMO clique
+  const lockKey = `card:${cardId}`;
+  if (!acquireLock(lockKey)) {
+    return res.status(200).json({ ok: true, message: 'Processamento em andamento' });
   }
 
   try {
@@ -343,20 +345,15 @@ app.post('/pipefy', async (req, res) => {
     const f = card.fields || [];
 
     const disparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
-    const dados = montarDados(card);
 
-    // 1) se checkbox não marcado, não faz nada
+    // Se checkbox não está marcado, não faz nada
     if (!disparo) {
-      endOnce(idemKey);
+      releaseLock(lockKey);
       return res.status(200).json({ ok: true, message: 'Checkbox não marcado' });
     }
 
-    // 2) se já tem link D4 gravado, evita reprocessar
-    if (dados.linkD4) {
-      endOnce(idemKey);
-      return res.status(200).json({ ok: true, message: 'Contrato já gerado', link: dados.linkD4 });
-    }
-
+    // A cada marcação (true) sempre gera UM contrato novo
+    const dados = montarDados(card);
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
     const uuidSafe = COFRES_UUIDS[dados.vendedor];
@@ -375,23 +372,23 @@ app.post('/pipefy', async (req, res) => {
 
     const link = `https://secure.d4sign.com.br/Plus/${d4uuid}`;
 
-    // 3) grava o link no card
+    // grava o link no card
     await setCardFieldValue(card.id, FIELD_ID_LINKS_D4, link);
 
-    // 4) desmarca o checkbox (prevenção contra reruns futuros)
+    // desmarca o checkbox para permitir um novo teste quando marcar de novo
     await setCardFieldValue(card.id, FIELD_ID_CHECKBOX_DISPARO, 'false');
 
-    // 5) move de fase com tolerância
+    // move de fase com tolerância
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
 
     console.log(`[SUCESSO] Documento ${card.title} enviado para D4Sign com UUID ${d4uuid}`);
-    endOnce(idemKey);
+    releaseLock(lockKey);
     return res.json({ ok: true, d4uuid, link });
 
   } catch (e) {
     console.error('[ERRO PIPEFY-D4SIGN]', e.code || e.message || e);
-    endOnce(idemKey);
-    // ainda devolvemos 200 para evitar múltiplos retries automáticos do origin
+    releaseLock(lockKey);
+    // devolvemos 200 para evitar retries em cascata do origin
     return res.status(200).json({ ok: false, error: e.code || e.message || 'Erro desconhecido' });
   }
 });
