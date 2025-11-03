@@ -12,7 +12,7 @@ const { URL } = require('url');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// Keep-Alive agents para conexões mais estáveis
+// Keep-Alive
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 60_000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: 60_000 });
 
@@ -25,9 +25,9 @@ const {
   PIPE_GRAPHQL_ENDPOINT = 'https://api.pipefy.com/graphql',
 
   // D4Sign
-  D4SIGN_CRYPT_KEY,
-  D4SIGN_TOKEN, // tokenAPI
-  TEMPLATE_UUID_CONTRATO, // UUID do template configurado no painel da D4Sign
+  D4SIGN_CRYPT_KEY,          // cryptKey
+  D4SIGN_TOKEN,              // tokenAPI
+  TEMPLATE_UUID_CONTRATO,    // ID do template Word
 
   // Pipefy
   PHASE_ID_PROPOSTA,
@@ -175,22 +175,19 @@ function montarADD(d) {
   };
 }
 
+// Signers mínimos para começar
 function montarSigners(d) {
   return [{
     email: d.email,
-    name: d.nome,
-    foreign: '0',
-    auths: ['assinatura'],
-    languagem: 'pt-BR',
-    type_signer: 'sign',
-    doc_type: '0'
+    name: d.nome
   }];
 }
 
 // ============================================================================
-// D4SIGN
+// D4SIGN – WORD TEMPLATE
 // ============================================================================
-async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, uuidTemplate, title, add, signers) {
+
+async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, varsObj) {
   const base = 'https://secure.d4sign.com.br';
   const url = new URL(`/api/v1/documents/${uuidSafe}/makedocumentbytemplateword`, base);
   url.searchParams.set('tokenAPI', tokenAPI);
@@ -198,33 +195,52 @@ async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, uuidTemplate, titl
 
   const body = {
     name_document: title,
-    id_template: [uuidTemplate],
-    ADD: add,
-    signers
-    // Se precisar, você pode incluir: uuid_folder, skip_email, workflow, etc
+    id_template: [templateId],
+    ADD: varsObj
   };
 
-  console.log(`[D4SIGN] POST ${url.toString()}`);
   const res = await fetchWithRetry(url.toString(), {
     method: 'POST',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !(json.uuid || json.uuid_document)) {
+    console.error('[ERRO D4SIGN WORD]', res.status, json);
+    throw new Error(`Falha D4Sign(WORD): ${res.status}`);
+  }
+  return json.uuid || json.uuid_document;
+}
+
+// Cadastra signatários após criar o documento
+async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
+  const base = 'https://secure.d4sign.com.br';
+  const url = new URL(`/api/v1/documents/${uuidDocument}/createlist`, base);
+  url.searchParams.set('tokenAPI', tokenAPI);
+  url.searchParams.set('cryptKey', cryptKey);
+
+  const body = { signers };
+
+  const res = await fetchWithRetry(url.toString(), {
+    method: 'POST',
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
 
   const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = null; }
-
-  if (!res.ok || !data || !data.uuid_document) {
-    console.error(`[ERRO D4SIGN] HTTP ${res.status} → ${text}`);
-    throw new Error(`Falha D4Sign: ${res.status}`);
+  if (!res.ok) {
+    console.error('[ERRO D4SIGN createlist]', res.status, text);
+    throw new Error(`Falha ao cadastrar signatários: ${res.status}`);
   }
+  return text;
+}
 
-  console.log(`[D4SIGN] OK uuid=${data.uuid_document}`);
-  return data.uuid_document;
+// Orquestração Word
+async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, templateId, title, addVars, signers) {
+  const uuidDoc = await makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, addVars);
+  await cadastrarSignatarios(tokenAPI, cryptKey, uuidDoc, signers);
+  return uuidDoc;
 }
 
 // ============================================================================
@@ -268,7 +284,7 @@ app.post('/pipefy', async (req, res) => {
       D4SIGN_TOKEN,           // tokenAPI
       D4SIGN_CRYPT_KEY,       // cryptKey
       uuidSafe,               // UUID do SAFE
-      TEMPLATE_UUID_CONTRATO, // UUID do template
+      TEMPLATE_UUID_CONTRATO, // ID do template (.docx)
       card.title,
       add,
       signers
