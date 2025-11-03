@@ -1,5 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN (logs detalhados + trigger tolerante)
+// PIPEFY + D4SIGN (logs corretos + decisão por estado do card + idempotência)
 // ============================================================================
 
 const express = require('express');
@@ -20,7 +20,7 @@ app.use((req, res, next) => {
 // 2) Parser de JSON
 app.use(express.json({ limit: '2mb' }));
 
-// 3) Logger de corpo (após parse) – só imprime se for JSON
+// 3) Logger de corpo após parse
 app.use((req, res, next) => {
   if ((req.headers['content-type'] || '').includes('application/json')) {
     try {
@@ -30,7 +30,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
 
 // Keep-Alive
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 60_000 });
@@ -52,7 +51,7 @@ const {
   // Pipefy
   PHASE_ID_CONTRATO_ENVIADO,
 
-  // Cofres por vendedor (uuid do SAFE)
+  // Cofres por vendedor
   COFRE_UUID_EDNA,
   COFRE_UUID_GREYCE,
   COFRE_UUID_MARIANA,
@@ -65,12 +64,10 @@ const {
   COFRE_UUID_MAURO,
 } = process.env;
 
-const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato'; // select/checkbox "Sim"
+const FIELD_ID_CHECKBOX_DISPARO = 'gerar_contrato';
 const FIELD_ID_LINKS_D4 = 'd4_contrato';
 
-// ============================================================================
 // Cofres por vendedor
-// ============================================================================
 const COFRES_UUIDS = {
   'EDNA BERTO DA SILVA': COFRE_UUID_EDNA,
   'Greyce Maria Candido Souza': COFRE_UUID_GREYCE,
@@ -85,12 +82,12 @@ const COFRES_UUIDS = {
 };
 
 // ============================================================================
-// Idempotência: lock curto + janela de reprocesso por card
+// Idempotência
 // ============================================================================
 const inFlight = new Set();
-const lastProcessed = new Map(); // cardId -> timestamp
 const LOCK_RELEASE_MS = 30_000;
-const REPROCESS_COOLDOWN_MS = 3 * 60 * 1000; // 3 min
+const lastProcessed = new Map(); // cardId -> timestamp
+const REPROCESS_COOLDOWN_MS = 3 * 60 * 1000;
 
 function acquireLock(key) {
   if (inFlight.has(key)) return false;
@@ -180,6 +177,7 @@ async function setCardFieldText(cardId, fieldId, text) {
   await gql(q, vars);
 }
 
+// Move com tolerância
 async function moveCardToPhaseSafe(card, destPhaseId) {
   if (card?.current_phase?.id === destPhaseId) return;
   const q = `
@@ -216,7 +214,7 @@ function montarDados(card) {
   };
 }
 
-// tokens Word
+// Tokens Word
 function montarADDWord(d) {
   return {
     contratante_1: d.nome || '',
@@ -228,6 +226,26 @@ function montarADDWord(d) {
 
 function montarSigners(d) {
   return [{ email: d.email, name: d.nome, act: '1', foreign: '0', send_email: '1' }];
+}
+
+// Normalização de checkbox/select
+function normalizeCheck(v) {
+  if (v == null) return '';
+  if (typeof v === 'boolean') return v ? 'sim' : '';
+  if (Array.isArray(v)) {
+    const s = v.map(x => String(x || '').toLowerCase()).join(',');
+    return s.includes('sim') ? 'sim' : s;
+  }
+  const s = String(v).toLowerCase().trim();
+  if (s === 'true' || s === 'yes') return 'sim';
+  return s;
+}
+
+// Log de decisão
+function logDecision(step, obj) {
+  try {
+    console.log(`[DECISION] ${step} :: ${JSON.stringify(obj)}`);
+  } catch { console.log(`[DECISION] ${step}`); }
 }
 
 // ============================================================================
@@ -283,52 +301,8 @@ async function criarDocumentoD4(tokenAPI, cryptKey, uuidSafe, templateId, title,
 }
 
 // ============================================================================
-// Edge trigger: detecta marcação para "Sim" com tolerância
-// ============================================================================
-function wasJustMarked(reqBody) {
-  // 1) action.field
-  const f1 = reqBody?.data?.action?.field;
-  if (f1 && (f1.id === FIELD_ID_CHECKBOX_DISPARO || f1.internal_id === FIELD_ID_CHECKBOX_DISPARO)) {
-    const prev = normalizeCheck(f1.previous_value);
-    const now  = normalizeCheck(f1.value);
-    if (now === 'sim' && prev !== 'sim') return true;
-  }
-  // 2) action.fields array
-  const arr = reqBody?.data?.action?.fields;
-  if (Array.isArray(arr)) {
-    for (const itm of arr) {
-      const idok = itm?.field?.id === FIELD_ID_CHECKBOX_DISPARO || itm?.field?.internal_id === FIELD_ID_CHECKBOX_DISPARO;
-      if (!idok) continue;
-      const prev = normalizeCheck(itm.previous_value);
-      const now  = normalizeCheck(itm.value);
-      if (now === 'sim' && prev !== 'sim') return true;
-    }
-  }
-  // 3) fallback com name/new_value
-  const maybe = reqBody?.data?.action?.name === FIELD_ID_CHECKBOX_DISPARO &&
-                normalizeCheck(reqBody?.data?.action?.new_value) === 'sim';
-  if (maybe) return true;
-
-  return false;
-}
-
-function normalizeCheck(v) {
-  if (v == null) return '';
-  if (typeof v === 'boolean') return v ? 'sim' : '';
-  if (Array.isArray(v)) {
-    const s = v.map(x => String(x || '').toLowerCase()).join(',');
-    return s.includes('sim') ? 'sim' : s;
-  }
-  const s = String(v).toLowerCase().trim();
-  if (s === 'true' || s === 'yes') return 'sim';
-  return s;
-}
-
-// ============================================================================
 // ROTAS
 // ============================================================================
-
-// Endpoint para debugar payload bruto, se quiser apontar o webhook aqui temporariamente
 app.post('/webhook-dump', (req, res) => {
   console.log('[DUMP] corpo normalizado:', JSON.stringify(req.body).slice(0, 4000));
   res.json({ ok: true });
@@ -337,6 +311,7 @@ app.post('/webhook-dump', (req, res) => {
 app.get('/', (req, res) => res.send('Servidor ativo e rodando'));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Handler principal baseado no estado atual do card
 app.post('/pipefy', async (req, res) => {
   console.log('[PIPEFY] webhook recebido em /pipefy');
   const cardId = req.body?.data?.action?.card?.id;
@@ -345,10 +320,6 @@ app.post('/pipefy', async (req, res) => {
     return res.status(400).json({ error: 'Sem cardId' });
   }
 
-  // edge trigger principal
-  let triggerNow = wasJustMarked(req.body);
-
-  // lock de clique simultâneo
   const lockKey = `card:${cardId}`;
   if (!acquireLock(lockKey)) {
     return res.status(200).json({ ok: true, message: 'Processamento em andamento' });
@@ -368,31 +339,37 @@ app.post('/pipefy', async (req, res) => {
       { cardId }
     );
     const card = data.card;
+    const f = card.fields || [];
 
-    // fallback tolerante: se o campo estiver "Sim" no card e não processamos nos últimos 3min, processa
-    if (!triggerNow) {
-      const f = card.fields || [];
-      const val = normalizeCheck(getField(f, FIELD_ID_CHECKBOX_DISPARO));
-      if (val === 'sim') {
-        const last = lastProcessed.get(card.id) || 0;
-        if (Date.now() - last > REPROCESS_COOLDOWN_MS) {
-          triggerNow = true;
-          console.log('[PIPEFY] fallback: campo está Sim e cooldown ok; processando mesmo assim');
-        }
-      }
-    }
+    const rawDisparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
+    const rawLink    = getField(f, FIELD_ID_LINKS_D4);
 
-    if (!triggerNow) {
+    const disparo = normalizeCheck(rawDisparo);
+    const hasLink = !!rawLink;
+
+    logDecision('estado_atual', { cardId, disparo, rawDisparo, hasLink });
+
+    if (disparo !== 'sim') {
+      logDecision('ignorado_sem_marcacao', { motivo: 'gerar_contrato != Sim' });
       releaseLock(lockKey);
-      return res.status(200).json({ ok: true, message: 'Evento ignorado (sem transição/condição)' });
+      return res.status(200).json({ ok: true, message: 'Sem marcação' });
     }
 
-    // monta dados e executa
+    if (hasLink) {
+      logDecision('ignorado_ja_tem_link', { motivo: 'link já gravado' });
+      releaseLock(lockKey);
+      return res.status(200).json({ ok: true, message: 'Contrato já gerado', link: rawLink });
+    }
+
     const dados = montarDados(card);
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
     const uuidSafe = COFRES_UUIDS[dados.vendedor];
-    if (!uuidSafe) throw new Error(`Cofre não configurado para vendedor: ${dados.vendedor}`);
+
+    if (!uuidSafe) {
+      logDecision('erro_sem_cofre', { vendedor: dados.vendedor });
+      throw new Error(`Cofre não configurado para vendedor: ${dados.vendedor}`);
+    }
 
     const d4uuid = await criarDocumentoD4(
       D4SIGN_TOKEN, D4SIGN_CRYPT_KEY, uuidSafe,
@@ -404,7 +381,7 @@ app.post('/pipefy', async (req, res) => {
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
 
     lastProcessed.set(card.id, Date.now());
-    console.log(`[SUCESSO] Documento ${card.title} enviado para D4Sign com UUID ${d4uuid}`);
+    logDecision('sucesso', { d4uuid, link });
     releaseLock(lockKey);
     return res.json({ ok: true, d4uuid, link });
 
