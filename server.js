@@ -179,8 +179,15 @@ function montarADDWord(d) {
 }
 
 function montarSigners(d) {
-  return [{ email: d.email, name: d.nome }];
+  return [{
+    email: d.email,
+    name: d.nome,
+    act: "1",            
+    foreign: "0",        
+    send_email: "1"      
+  }];
 }
+
 
 // ============================================================================
 // D4SIGN – WORD (formato que funcionou no seu teste: templates{ <id>: {vars} })
@@ -220,7 +227,16 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
   url.searchParams.set('tokenAPI', tokenAPI);
   url.searchParams.set('cryptKey', cryptKey);
 
-  const body = { signers };
+  // Garante que todo signer tenha os campos mínimos exigidos
+  const signersPayload = signers.map(s => ({
+    email: s.email,
+    name: s.name,
+    act: s.act || "1",
+    foreign: s.foreign || "0",
+    send_email: s.send_email || "1"
+  }));
+
+  const body = { signers: signersPayload };
 
   const res = await fetchWithRetry(url.toString(), {
     method: 'POST',
