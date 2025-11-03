@@ -231,14 +231,35 @@ function montarSigners(d) {
 // Normalização de checkbox/select
 function normalizeCheck(v) {
   if (v == null) return '';
+
+  // valor boolean
   if (typeof v === 'boolean') return v ? 'sim' : '';
+
+  // valor array real
   if (Array.isArray(v)) {
-    const s = v.map(x => String(x || '').toLowerCase()).join(',');
-    return s.includes('sim') ? 'sim' : s;
+    const s = v.map(x => String(x || '').toLowerCase());
+    return s.includes('sim') ? 'sim' : '';
   }
-  const s = String(v).toLowerCase().trim();
-  if (s === 'true' || s === 'yes') return 'sim';
-  return s;
+
+  // valor string
+  let s = String(v).trim();
+
+  // se for string com cara de JSON array, tenta parsear
+  if (s.startsWith('[') && s.endsWith(']')) {
+    try {
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) {
+        const norm = arr.map(x => String(x || '').toLowerCase());
+        return norm.includes('sim') ? 'sim' : '';
+      }
+    } catch { /* ignora e cai no fluxo normal */ }
+  }
+
+  s = s.toLowerCase();
+  if (s === 'true' || s === 'yes' || s === 'sim') return 'sim';
+  // alguns workspaces mandam "checked"
+  if (s === 'checked') return 'sim';
+  return '';
 }
 
 // Log de decisão
