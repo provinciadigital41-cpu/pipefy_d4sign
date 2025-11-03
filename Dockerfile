@@ -1,6 +1,6 @@
 # Base Debian estável, compatível com HTTPS e ferramentas de rede
 FROM node:18-bullseye
-ARG GIT_SHA
+ARG GIT_SHA=manual
 ENV GIT_SHA=$GIT_SHA
 
 # Diretório de trabalho dentro do container
