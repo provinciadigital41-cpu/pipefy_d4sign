@@ -172,25 +172,27 @@ async function setCardFieldText(cardId, fieldId, text) {
   await gql(q, vars);
 }
 
-// Seta ou limpa campo select. label = "Sim" para marcar, null para limpar.
-async function setCardFieldOption(cardId, fieldId, label) {
-  const qA = `
-    mutation($input: UpdateCardFieldInput!) {
-      updateCardField(input: $input) { card { id } }
+// Limpa valor do campo via deleteCardFieldValue (necessário para "desmarcar" checkbox/select)
+async function clearCardFieldValue(cardId, fieldId) {
+  // Variante principal: deleteCardFieldValue
+  const q = `
+    mutation($input: DeleteCardFieldValueInput!) {
+      deleteCardFieldValue(input: $input) { success }
     }
   `;
-  const vA = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: label ? String(label) : "" } } };
+  const vars = { input: { card_id: cardId, field_id: fieldId } };
   try {
-    await gql(qA, vA);
+    await gql(q, vars);
     return;
-  } catch (eA) {
-    const qB = `
+  } catch (e) {
+    // Fallback: tenta setar para array vazio (alguns workspaces aceitam)
+    const q2 = `
       mutation($input: UpdateCardFieldInput!) {
         updateCardField(input: $input) { card { id } }
       }
     `;
-    const vB = { input: { card_id: cardId, field_id: fieldId, new_value: { array_value: label ? [String(label)] : [] } } };
-    await gql(qB, vB);
+    const v2 = { input: { card_id: cardId, field_id: fieldId, new_value: { array_value: [] } } };
+    await gql(q2, v2);
   }
 }
 
@@ -382,8 +384,8 @@ app.post('/pipefy', async (req, res) => {
     // grava o link no card
     await setCardFieldText(card.id, FIELD_ID_LINKS_D4, link);
 
-    // limpa o campo "gerar_contrato" (select) para permitir marcar novamente depois
-    await setCardFieldOption(card.id, FIELD_ID_CHECKBOX_DISPARO, null);
+    // limpa o campo "gerar_contrato" para permitir marcar novamente depois
+    await clearCardFieldValue(card.id, FIELD_ID_CHECKBOX_DISPARO);
 
     // move de fase com tolerância
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
