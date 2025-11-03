@@ -1,5 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN (logs corretos + decisão por estado do card + idempotência)
+// PIPEFY + D4SIGN (logs + decisão por estado + idempotência + reprocesso via toggle)
 // ============================================================================
 
 const express = require('express');
@@ -82,12 +82,13 @@ const COFRES_UUIDS = {
 };
 
 // ============================================================================
-// Idempotência
+// Idempotência + memória de toggle
 // ============================================================================
 const inFlight = new Set();
 const LOCK_RELEASE_MS = 30_000;
-const lastProcessed = new Map(); // cardId -> timestamp
-const REPROCESS_COOLDOWN_MS = 3 * 60 * 1000;
+
+const lastDisparoByCard = new Map(); // cardId -> 'sim' | ''
+const lastProcessedAt = new Map();    // cardId -> timestamp (opcional, apenas log/diagnóstico)
 
 function acquireLock(key) {
   if (inFlight.has(key)) return false;
@@ -232,19 +233,17 @@ function montarSigners(d) {
 function normalizeCheck(v) {
   if (v == null) return '';
 
-  // valor boolean
+  // boolean
   if (typeof v === 'boolean') return v ? 'sim' : '';
 
-  // valor array real
+  // array real
   if (Array.isArray(v)) {
     const s = v.map(x => String(x || '').toLowerCase());
     return s.includes('sim') ? 'sim' : '';
   }
 
-  // valor string
+  // string – pode vir como '["Sim"]'
   let s = String(v).trim();
-
-  // se for string com cara de JSON array, tenta parsear
   if (s.startsWith('[') && s.endsWith(']')) {
     try {
       const arr = JSON.parse(s);
@@ -252,13 +251,11 @@ function normalizeCheck(v) {
         const norm = arr.map(x => String(x || '').toLowerCase());
         return norm.includes('sim') ? 'sim' : '';
       }
-    } catch { /* ignora e cai no fluxo normal */ }
+    } catch { /* segue */ }
   }
 
   s = s.toLowerCase();
-  if (s === 'true' || s === 'yes' || s === 'sim') return 'sim';
-  // alguns workspaces mandam "checked"
-  if (s === 'checked') return 'sim';
+  if (s === 'true' || s === 'yes' || s === 'sim' || s === 'checked') return 'sim';
   return '';
 }
 
@@ -332,7 +329,7 @@ app.post('/webhook-dump', (req, res) => {
 app.get('/', (req, res) => res.send('Servidor ativo e rodando'));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Handler principal baseado no estado atual do card
+// Handler principal baseado no estado atual e na memória de toggle
 app.post('/pipefy', async (req, res) => {
   console.log('[PIPEFY] webhook recebido em /pipefy');
   const cardId = req.body?.data?.action?.card?.id;
@@ -365,23 +362,30 @@ app.post('/pipefy', async (req, res) => {
     const rawDisparo = getField(f, FIELD_ID_CHECKBOX_DISPARO);
     const rawLink    = getField(f, FIELD_ID_LINKS_D4);
 
-    const disparo = normalizeCheck(rawDisparo);
+    const disparo = normalizeCheck(rawDisparo); // 'sim' | ''
     const hasLink = !!rawLink;
+    const lastDisparo = lastDisparoByCard.get(card.id) || '';
 
-    logDecision('estado_atual', { cardId, disparo, rawDisparo, hasLink });
+    logDecision('estado_atual', { cardId, disparo, rawDisparo, hasLink, lastDisparo });
 
-    if (disparo !== 'sim') {
-      logDecision('ignorado_sem_marcacao', { motivo: 'gerar_contrato != Sim' });
+    // Regra de geração:
+    // - gerar se (disparo === 'sim' && lastDisparo !== 'sim')  => houve toggle ON agora
+    // - ou se (disparo === 'sim' && !hasLink)                 => primeira vez sem link
+    const shouldGenerate = (disparo === 'sim' && lastDisparo !== 'sim') || (disparo === 'sim' && !hasLink);
+
+    // Atualiza memória de estado ANTES de executar (para não duplicar em falhas de rede/retry)
+    lastDisparoByCard.set(card.id, disparo);
+
+    if (!shouldGenerate) {
+      const motivo = disparo !== 'sim'
+        ? 'gerar_contrato != Sim'
+        : 'sem transição para Sim e já existe link';
+      logDecision('ignorado', { motivo });
       releaseLock(lockKey);
-      return res.status(200).json({ ok: true, message: 'Sem marcação' });
+      return res.status(200).json({ ok: true, message: 'Ignorado', reason: motivo, link: rawLink || null });
     }
 
-    if (hasLink) {
-      logDecision('ignorado_ja_tem_link', { motivo: 'link já gravado' });
-      releaseLock(lockKey);
-      return res.status(200).json({ ok: true, message: 'Contrato já gerado', link: rawLink });
-    }
-
+    // Monta e gera
     const dados = montarDados(card);
     const add = montarADDWord(dados);
     const signers = montarSigners(dados);
@@ -401,7 +405,7 @@ app.post('/pipefy', async (req, res) => {
     await setCardFieldText(card.id, FIELD_ID_LINKS_D4, link);
     await moveCardToPhaseSafe(card, PHASE_ID_CONTRATO_ENVIADO);
 
-    lastProcessed.set(card.id, Date.now());
+    lastProcessedAt.set(card.id, Date.now());
     logDecision('sucesso', { d4uuid, link });
     releaseLock(lockKey);
     return res.json({ ok: true, d4uuid, link });
