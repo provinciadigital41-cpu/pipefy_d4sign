@@ -10,23 +10,27 @@ const https = require('https');
 const { URL } = require('url');
 
 const app = express();
-app.use(express.json({ limit: '2mb' })); // aumenta limite p/ log
 
-// ---------------------------
-// LOG GLOBAL DE REQUISIÇÕES
-// ---------------------------
+// 1) Logger leve SEM consumir o stream
 app.use((req, res, next) => {
-  const chunks = [];
-  req.on('data', (c) => chunks.push(c));
-  req.on('end', () => {
-    const raw = Buffer.concat(chunks).toString('utf8');
-    const bodyPreview = raw ? raw.slice(0, 4000) : '';
-    console.log(`[REQ] ${req.method} ${req.originalUrl} ip=${req.headers['x-forwarded-for'] || req.ip}`);
-    console.log(`[REQ-H] content-type=${req.headers['content-type'] || ''}`);
-    if (bodyPreview) console.log(`[REQ-BODY<=4KB] ${bodyPreview}`);
-    next();
-  });
+  console.log(`[REQ] ${req.method} ${req.originalUrl} ip=${req.headers['x-forwarded-for'] || req.ip}`);
+  next();
 });
+
+// 2) Parser de JSON
+app.use(express.json({ limit: '2mb' }));
+
+// 3) Logger de corpo (após parse) – só imprime se for JSON
+app.use((req, res, next) => {
+  if ((req.headers['content-type'] || '').includes('application/json')) {
+    try {
+      const preview = JSON.stringify(req.body).slice(0, 2000);
+      console.log(`[REQ-BODY<=2KB] ${preview}`);
+    } catch (_) {}
+  }
+  next();
+});
+
 
 // Keep-Alive
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 60_000 });
