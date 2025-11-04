@@ -1,6 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN (link público externo + confirmação e geração sob demanda)
-// Modelo alinhado ao "CONTRATO NOVO MODELO D4.docx"
+// PIPEFY + D4SIGN (link público + revisão e geração sob demanda)
 // ============================================================================
 
 const express = require('express');
@@ -13,7 +12,7 @@ const { URL } = require('url');
 
 const app = express();
 
-// Logs leves
+// Logs
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.originalUrl} ip=${req.headers['x-forwarded-for'] || req.ip}`);
   next();
@@ -141,23 +140,16 @@ async function gql(query, vars) {
 function unwrapValue(v) {
   if (v == null) return '';
   if (typeof v === 'string') {
-    try {
-      // casos que vêm com => do Ruby
-      if (v.includes('string_value') && v.includes('=>')) {
-        const fixed = v.replace(/=>/g, ':').replace(/:(\s*)([a-zA-Z_]+)/g, ': "$2"');
-        const parsed = JSON.parse(fixed);
-        if (parsed && parsed.string_value) return String(parsed.string_value);
-      }
-      // string normal
-      return v;
-    } catch { return v; }
+    // caso Ruby-like {"string_value"=>"..."}
+    const m = v.match(/"string_value"\s*=>\s*"([^"]+)"/);
+    if (m) return m[1];
+    return v;
   }
   if (typeof v === 'object' && v.string_value) return String(v.string_value);
   return String(v);
 }
 
 async function setCardFieldText(cardId, fieldId, text) {
-  // grava só string_value para manter o campo limpo (apenas o link)
   const q = `
     mutation($input: UpdateCardFieldInput!) {
       updateCardField(input: $input) { card { id } }
@@ -245,7 +237,7 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
 }
 
 // ============================================================================
-// Montagem de dados e tokens compatíveis com o DOCX novo
+// Montagem de dados e tokens (modelo novo)
 // ============================================================================
 function montarDados(card) {
   const f = card.fields || [];
@@ -257,13 +249,20 @@ function montarDados(card) {
     try { const tmp = JSON.parse(serviziRaw); if (Array.isArray(tmp)) servicos = tmp; } catch {}
   }
 
+  // parcelas pode vir "10X" etc.
+  const parcelasRaw = getField(f, 'quantidade_de_parcelas') || '1';
+  const parcelasNum = (() => {
+    const m = String(parcelasRaw).match(/(\d+)/);
+    return m ? Number(m[1]) : Number(parcelasRaw) || 1;
+  })();
+
   return {
     // Identificação e endereço
     nome: getField(f, 'nome_do_contato') || '',
     estado_civil: getField(f, 'estado_civil') || '',
     rua: getField(f, 'rua') || '',
     bairro: getField(f, 'bairro') || '',
-    numero: getField(f, 'numero') || '',
+    numero: getField(f, 'n_mero') || '',   // <- corrigido
     cidade: getField(f, 'cidade') || '',
     uf: getField(f, 'uf') || '',
     cep: getField(f, 'cep') || '',
@@ -276,13 +275,14 @@ function montarDados(card) {
 
     // Serviços
     servicos,
-    nome_marca: getField(f, 'nome_marca') || '',
+    nome_marca: getField(f, 'neg_cio') || '', // <- corrigido
     classe: getField(f, 'classe') || '',
-    risco: getField(f, 'risco') || '',
+    risco: getField(f, 'risco_marca') || '',  // <- corrigido
 
     // Remuneração (assessoria)
     valor_total: getField(f, 'valor_do_neg_cio') || '',
-    parcelas: Number(getField(f, 'quantidade_de_parcelas') || 1),
+    parcelas: parcelasNum,
+    forma_pagto_assessoria: getField(f, 'm_todo_de_pagamento') || '', // <- novo
 
     // Pesquisa de viabilidade (select id "paga": paga | isenta)
     pesquisa_status: String(getField(f, 'paga') || '').toLowerCase(),
@@ -307,7 +307,7 @@ function montarADDWord(d) {
   const parcelaN = totalN / parcelas;
   const valorParcelaSemRS = moneyBRNoSymbol(parcelaN);
 
-  // pesquisa: se isenta, deixamos o token numérico vazio (seu DOCX usa "R$ ${Valor da Pesquisa},00")
+  // pesquisa: se isenta, deixamos vazio pois o DOCX usa "R$ ${Valor da Pesquisa},00"
   const valorPesquisaSemRS = d.pesquisa_status === 'isenta' ? '' : '';
 
   // taxa
@@ -330,7 +330,6 @@ function montarADDWord(d) {
       ].filter(Boolean).join(', ')
     : '';
 
-  // Retorna com os nomes literais dos TOKENS no DOCX
   return {
     'Contratante 1': d.nome,
     'Estado Civíl': d.estado_civil,
@@ -352,15 +351,15 @@ function montarADDWord(d) {
     'Classe': d.classe,
 
     'Número de parcelas da Assessoria': String(parcelas),
-    'Valor da parcela da Assessoria': valorParcelaSemRS, // ex.: "123,45" (sem R$)
-    'Forma de pagamento da Assessoria': '',
+    'Valor da parcela da Assessoria': valorParcelaSemRS,
+    'Forma de pagamento da Assessoria': d.forma_pagto_assessoria || '',
     'Data de pagamento da Assessoria': '',
 
-    'Valor da Pesquisa': valorPesquisaSemRS,            // vazio quando isenta
+    'Valor da Pesquisa': valorPesquisaSemRS,
     'Forma de pagamento da Pesquisa': '',
     'Data de pagamento da pesquisa': '',
 
-    'Valor da Taxa': valorTaxaSemRS,                    // "440,00" ou "880,00"
+    'Valor da Taxa': valorTaxaSemRS,
     'Forma de pagamento da Taxa': '',
     'Data de pagamento da Taxa': '',
 
@@ -454,6 +453,7 @@ app.get('/lead/:token', async (req, res) => {
     <div class="grid">
       <div><div class="label">Parcelas</div><div>${String(d.parcelas||'1')}</div></div>
       <div><div class="label">Valor total</div><div>${moneyBRNoSymbol(onlyNumberBR(d.valor_total))}</div></div>
+      <div><div class="label">Forma de pagamento</div><div>${d.forma_pagto_assessoria||'-'}</div></div>
     </div>
 
     <form method="POST" action="/lead/${encodeURIComponent(req.params.token)}/generate" style="margin-top:24px">
@@ -520,7 +520,7 @@ app.post('/lead/:token/generate', async (req, res) => {
 });
 
 // ============================================================================
-// WEBHOOK PIPEFY: cria o link público no campo do card (apenas a URL pura)
+// WEBHOOK PIPEFY: cria o link público no campo do card (só a URL)
 // ============================================================================
 app.post('/pipefy', async (req, res) => {
   console.log('[PIPEFY] webhook recebido em /pipefy');
@@ -546,15 +546,16 @@ app.post('/pipefy', async (req, res) => {
     const f = card.fields || [];
 
     const disparo = normalizeCheck(getField(f, FIELD_ID_CHECKBOX_DISPARO));
-    const already = getField(f, FIELD_ID_LINKS_D4);
-    logDecision('estado_atual', { cardId, disparo, rawLink: already });
+    const alreadyRaw = getField(f, FIELD_ID_LINKS_D4);
+    const already = unwrapValue(alreadyRaw);
+    logDecision('estado_atual', { cardId, disparo, already });
 
     if (disparo !== 'sim') {
       releaseLock(lockKey);
       return res.status(200).json({ ok: true, message: 'Campo gerar_contrato != Sim' });
     }
 
-    // Gera link público e grava apenas o texto puro
+    // Gera link público e grava apenas a URL pura
     const token = mkLeadToken(card.id);
     const leadUrl = `${PUBLIC_BASE_URL.replace(/\/$/,'')}/lead/${encodeURIComponent(token)}`;
     await setCardFieldText(card.id, FIELD_ID_LINKS_D4, leadUrl);
