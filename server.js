@@ -140,7 +140,6 @@ async function gql(query, vars) {
 function unwrapValue(v) {
   if (v == null) return '';
   if (typeof v === 'string') {
-    // caso Ruby-like {"string_value"=>"..."}
     const m = v.match(/"string_value"\s*=>\s*"([^"]+)"/);
     if (m) return m[1];
     return v;
@@ -262,7 +261,7 @@ function montarDados(card) {
     estado_civil: getField(f, 'estado_civil') || '',
     rua: getField(f, 'rua') || '',
     bairro: getField(f, 'bairro') || '',
-    numero: getField(f, 'n_mero') || '',   // <- corrigido
+    numero: getField(f, 'n_mero') || '',            // corrigido
     cidade: getField(f, 'cidade') || '',
     uf: getField(f, 'uf') || '',
     cep: getField(f, 'cep') || '',
@@ -275,14 +274,14 @@ function montarDados(card) {
 
     // Serviços
     servicos,
-    nome_marca: getField(f, 'neg_cio') || '', // <- corrigido
+    nome_marca: getField(f, 'neg_cio') || '',       // corrigido
     classe: getField(f, 'classe') || '',
-    risco: getField(f, 'risco_marca') || '',  // <- corrigido
+    risco: getField(f, 'risco_marca') || '',        // corrigido
 
     // Remuneração (assessoria)
     valor_total: getField(f, 'valor_do_neg_cio') || '',
     parcelas: parcelasNum,
-    forma_pagto_assessoria: getField(f, 'm_todo_de_pagamento') || '', // <- novo
+    forma_pagto_assessoria: getField(f, 'm_todo_de_pagamento') || '', // novo
 
     // Pesquisa de viabilidade (select id "paga": paga | isenta)
     pesquisa_status: String(getField(f, 'paga') || '').toLowerCase(),
@@ -290,17 +289,13 @@ function montarDados(card) {
     // Taxa de encaminhamento (select id "copy_of_pesquisa")
     taxa_faixa: String(getField(f, 'copy_of_pesquisa') || '').toLowerCase(),
 
-    // Local e data do rodapé
-    dia: getField(f, 'dia') || '',
-    mes: getField(f, 'mes') || '',
-    ano: getField(f, 'ano') || '',
-
     // Vendedor p/ cofre
     vendedor: card.assignees?.[0]?.name || 'Desconhecido'
   };
 }
 
-function montarADDWord(d) {
+// nowInfo é a data do momento da geração
+function montarADDWord(d, nowInfo) {
   // parcelas e valor da parcela (sem "R$")
   const parcelas = Math.max(1, Number(d.parcelas || 1));
   const totalN = onlyNumberBR(d.valor_total);
@@ -329,6 +324,14 @@ function montarADDWord(d) {
         d.classe ? `Classe: ${d.classe}` : ''
       ].filter(Boolean).join(', ')
     : '';
+
+  // Data baseada no momento da geração
+  const Dia = String(nowInfo.dia).padStart(2, '0');
+  const Mes = String(nowInfo.mes).padStart(2, '0');
+  const Ano = String(nowInfo.ano);
+
+  // Observações: repetir forma de pagamento
+  const observacoes = d.forma_pagto_assessoria || '';
 
   return {
     'Contratante 1': d.nome,
@@ -363,10 +366,15 @@ function montarADDWord(d) {
     'Forma de pagamento da Taxa': '',
     'Data de pagamento da Taxa': '',
 
+    // Observações — repetindo a forma de pagamento
+    'Observações': observacoes,
+    'Observacoes': observacoes,
+
+    // Data no rodapé com base na geração
     'Cidade': d.cidade,
-    'Dia': d.dia,
-    'Mês': d.mes,
-    'Ano': d.ano
+    'Dia': Dia,
+    'Mês': Mes,
+    'Ano': Ano
   };
 }
 
@@ -491,7 +499,12 @@ app.post('/lead/:token/generate', async (req, res) => {
 
     const card = data.card;
     const d = montarDados(card);
-    const add = montarADDWord(d);
+
+    // Data do momento da geração
+    const now = new Date();
+    const nowInfo = { dia: now.getDate(), mes: now.getMonth()+1, ano: now.getFullYear() };
+
+    const add = montarADDWord(d, nowInfo);
     const signers = montarSigners(d);
     const uuidSafe = COFRES_UUIDS[d.vendedor];
     if (!uuidSafe) throw new Error(`Cofre não configurado para vendedor: ${d.vendedor}`);
