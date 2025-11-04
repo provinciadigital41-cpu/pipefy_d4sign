@@ -1,5 +1,5 @@
 // ============================================================================
-// PIPEFY + D4SIGN (link público + revisão e geração sob demanda)
+// PIPEFY + D4SIGN (link público + revisão, download e envio para assinatura)
 // ============================================================================
 
 const express = require('express');
@@ -126,7 +126,7 @@ async function gql(query, vars) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PIPE_API_KEY}` },
     body: JSON.stringify({ query, variables: vars })
-  }, { attempts: 5, baseDelayMs: 500, timeoutMs: 20000 }); // <- corrigido aqui (timeoutMs: 20000)
+  }, { attempts: 5, baseDelayMs: 500, timeoutMs: 20000 });
 
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json.errors) {
@@ -148,14 +148,34 @@ function unwrapValue(v) {
   return String(v);
 }
 
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+// GRAVAÇÃO: usa updateFieldsValues para salvar APENAS a URL (string pura)
+// Fallback para updateCardField se necessário
+// <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 async function setCardFieldText(cardId, fieldId, text) {
-  const q = `
+  // 1) Tenta updateFieldsValues (valor simples)
+  const q1 = `
+    mutation($input: UpdateFieldsValuesInput!) {
+      updateFieldsValues(input: $input) { card { id } }
+    }
+  `;
+  const v1 = { input: { node_id: cardId, values: [{ field_id: fieldId, value: String(text) }] } };
+
+  try {
+    await gql(q1, v1);
+    return;
+  } catch (e) {
+    console.warn('[Pipefy] updateFieldsValues falhou, tentando updateCardField...', e?.message || e);
+  }
+
+  // 2) Fallback para updateCardField (schema alternativo)
+  const q2 = `
     mutation($input: UpdateCardFieldInput!) {
       updateCardField(input: $input) { card { id } }
     }
   `;
-  const vars = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: String(text) } } };
-  await gql(q, vars);
+  const v2 = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: String(text) } } };
+  await gql(q2, v2);
 }
 
 async function moveCardToPhaseSafe(cardId, destPhaseId) {
@@ -213,7 +233,8 @@ function logDecision(step, obj) {
 }
 
 // ============================================================================
-// D4Sign
+// D4Sign - criação por template Word, cadastro de signatários,
+// geração de URL de download, envio para assinatura
 // ============================================================================
 async function makeDocFromWordTemplate(tokenAPI, cryptKey, uuidSafe, templateId, title, varsObj) {
   const base = 'https://secure.d4sign.com.br';
@@ -245,6 +266,48 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
   }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
   const text = await res.text();
   if (!res.ok) { console.error('[ERRO D4SIGN createlist]', res.status, text); throw new Error(`Falha ao cadastrar signatários: ${res.status}`); }
+  return text;
+}
+// Gera URL de download (PDF) para um documento do D4Sign
+async function getDownloadUrl(tokenAPI, cryptKey, uuidDocument, { type = 'PDF', language = 'pt' } = {}) {
+  const base = 'https://secure.d4sign.com.br';
+  const url = new URL(`/api/v1/documents/${uuidDocument}/download`, base);
+  url.searchParams.set('tokenAPI', tokenAPI);
+  url.searchParams.set('cryptKey', cryptKey);
+  const body = { type, language, document: 'false' };
+  const res = await fetchWithRetry(url.toString(), {
+    method: 'POST',
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
+  const text = await res.text();
+  let json; try { json = JSON.parse(text); } catch { json = null; }
+  if (!res.ok || !json?.url) {
+    console.error('[ERRO D4SIGN download]', res.status, text);
+    throw new Error(`Falha ao gerar URL de download: ${res.status}`);
+  }
+  return json; // { url, name }
+}
+// Envia o documento para assinatura
+async function sendToSigner(tokenAPI, cryptKey, uuidDocument, {
+  message = '',
+  skip_email = '0',
+  workflow = '0'
+} = {}) {
+  const base = 'https://secure.d4sign.com.br';
+  const url = new URL(`/api/v1/documents/${uuidDocument}/sendtosigner`, base);
+  url.searchParams.set('cryptKey', cryptKey);
+  const body = { message, skip_email, workflow, tokenAPI };
+  const res = await fetchWithRetry(url.toString(), {
+    method: 'POST',
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }, { attempts: 5, baseDelayMs: 600, timeoutMs: 20000 });
+  const text = await res.text();
+  if (!res.ok) {
+    console.error('[ERRO D4SIGN sendtosigner]', res.status, text);
+    throw new Error(`Falha ao enviar para assinatura: ${res.status}`);
+  }
   return text;
 }
 
@@ -317,7 +380,6 @@ function montarDados(card) {
 
 // nowInfo é a data do momento da geração (com mês por extenso)
 function montarADDWord(d, nowInfo) {
-  // parcelas e valor da parcela (sem "R$")
   const parcelas = Math.max(1, Number(d.parcelas || 1));
   const totalN = onlyNumberBR(d.valor_total);
   const parcelaN = totalN / parcelas;
@@ -348,9 +410,9 @@ function montarADDWord(d, nowInfo) {
       ].filter(Boolean).join(', ')
     : '';
 
-  // Data no rodapé com base na geração
+  // Data no rodapé com base na geração (mês por extenso)
   const Dia = String(nowInfo.dia).padStart(2, '0');
-  const Mes = nowInfo.mesNome; // por extenso
+  const Mes = nowInfo.mesNome;
   const Ano = String(nowInfo.ano);
 
   // Observações: repetir forma de pagamento da assessoria
@@ -501,6 +563,7 @@ app.get('/lead/:token', async (req, res) => {
   }
 });
 
+// Gera o documento e mostra botões de Baixar PDF e Enviar para assinatura
 app.post('/lead/:token/generate', async (req, res) => {
   try {
     const { cardId } = parseLeadToken(req.params.token);
@@ -537,26 +600,87 @@ app.post('/lead/:token/generate', async (req, res) => {
     const uuidSafe = COFRES_UUIDS[d.vendedor];
     if (!uuidSafe) throw new Error(`Cofre não configurado para vendedor: ${d.vendedor}`);
 
+    // 1) Cria doc e 2) cadastra signatários (AINDA NÃO envia para assinatura)
     const uuidDoc = await makeDocFromWordTemplate(D4SIGN_TOKEN, D4SIGN_CRYPT_KEY, uuidSafe, TEMPLATE_UUID_CONTRATO, card.title, add);
     await cadastrarSignatarios(D4SIGN_TOKEN, D4SIGN_CRYPT_KEY, uuidDoc, signers);
+
+    // Move fase
     await moveCardToPhaseSafe(card.id, PHASE_ID_CONTRATO_ENVIADO);
 
     releaseLock(lockKey);
 
-    const okHtml = `
+    // 3) Página com duas ações: Download PDF e Enviar para assinatura
+    const token = req.params.token;
+    const html = `
 <!doctype html><meta charset="utf-8"><title>Contrato gerado</title>
-<style>body{font-family:system-ui;display:grid;place-items:center;height:100vh;background:#f7f7f7} .box{background:#fff;padding:24px;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.08);max-width:560px}</style>
+<style>
+  body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#f7f7f7;color:#111;margin:0}
+  .box{background:#fff;padding:24px;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.08);max-width:640px;width:92%}
+  h2{margin:0 0 12px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+  .btn{display:inline-block;padding:12px 16px;border-radius:10px;text-decoration:none;border:0;background:#111;color:#fff;font-weight:600}
+  .muted{color:#666}
+</style>
 <div class="box">
   <h2>Contrato gerado com sucesso</h2>
-  <p>Documento criado no D4Sign e card movido para “Contrato enviado”.</p>
-  <p>UUID: ${uuidDoc}</p>
+  <p class="muted">UUID do documento: ${uuidDoc}</p>
+  <div class="row">
+    <a class="btn" href="/lead/${encodeURIComponent(token)}/doc/${encodeURIComponent(uuidDoc)}/download" target="_blank" rel="noopener">Baixar PDF</a>
+    <form method="POST" action="/lead/${encodeURIComponent(token)}/doc/${encodeURIComponent(uuidDoc)}/send" style="display:inline">
+      <button class="btn" type="submit">Enviar para assinatura</button>
+    </form>
+    <a class="btn" href="${PUBLIC_BASE_URL}/lead/${encodeURIComponent(token)}">Voltar</a>
+  </div>
+</div>`;
+    return res.status(200).send(html);
+
+  } catch (e) {
+    console.error('[ERRO LEAD-GENERATE]', e.message || e);
+    return res.status(400).send('Falha ao gerar o contrato.');
+  }
+});
+
+// Download do PDF (redireciona para URL temporária do D4Sign)
+app.get('/lead/:token/doc/:uuid/download', async (req, res) => {
+  try {
+    const { cardId } = parseLeadToken(req.params.token);
+    if (!cardId) throw new Error('token inválido');
+    const uuidDoc = req.params.uuid;
+
+    const { url: downloadUrl } = await getDownloadUrl(D4SIGN_TOKEN, D4SIGN_CRYPT_KEY, uuidDoc, { type: 'PDF', language: 'pt' });
+    return res.redirect(302, downloadUrl);
+  } catch (e) {
+    console.error('[ERRO lead download]', e.message || e);
+    return res.status(400).send('Falha ao gerar link de download.');
+  }
+});
+
+// Enviar documento para assinatura
+app.post('/lead/:token/doc/:uuid/send', async (req, res) => {
+  try {
+    const { cardId } = parseLeadToken(req.params.token);
+    if (!cardId) throw new Error('token inválido');
+    const uuidDoc = req.params.uuid;
+
+    await sendToSigner(D4SIGN_TOKEN, D4SIGN_CRYPT_KEY, uuidDoc, {
+      message: 'Olá! Há um documento aguardando sua assinatura.',
+      skip_email: '0', // 0 = D4Sign notifica por e-mail
+      workflow: '0'
+    });
+
+    const okHtml = `
+<!doctype html><meta charset="utf-8"><title>Documento enviado</title>
+<style>body{font-family:system-ui;display:grid;place-items:center;height:100vh;background:#f7f7f7} .box{background:#fff;padding:24px;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.08);max-width:560px}</style>
+<div class="box">
+  <h2>Documento enviado para assinatura</h2>
+  <p>Os signatários foram notificados.</p>
   <p><a href="${PUBLIC_BASE_URL}/lead/${encodeURIComponent(req.params.token)}">Voltar</a></p>
 </div>`;
     return res.status(200).send(okHtml);
 
   } catch (e) {
-    console.error('[ERRO LEAD-GENERATE]', e.message || e);
-    return res.status(400).send('Falha ao gerar o contrato.');
+    console.error('[ERRO sendtosigner]', e.message || e);
+    return res.status(400).send('Falha ao enviar para assinatura.');
   }
 });
 
