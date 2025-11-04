@@ -126,7 +126,7 @@ async function gql(query, vars) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PIPE_API_KEY}` },
     body: JSON.stringify({ query, variables: vars })
-  }, { attempts: 5, baseDelayMs: 500, timeoutMs = 20000 });
+  }, { attempts: 5, baseDelayMs: 500, timeoutMs: 20000 }); // <- corrigido aqui (timeoutMs: 20000)
 
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json.errors) {
@@ -251,15 +251,19 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
 // ============================================================================
 // Montagem de dados e tokens (modelo novo)
 // ============================================================================
+function getFieldSafeArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try { const arr = JSON.parse(value); return Array.isArray(arr) ? arr : []; } catch { return [value]; }
+  }
+  return [];
+}
+
 function montarDados(card) {
   const f = card.fields || [];
 
-  // serviços pode vir array ou string JSON
-  const serviziRaw = getField(f, 'servi_os_de_contratos') || [];
-  let servicos = Array.isArray(serviziRaw) ? serviziRaw : [];
-  if (typeof serviziRaw === 'string') {
-    try { const tmp = JSON.parse(serviziRaw); if (Array.isArray(tmp)) servicos = tmp; } catch {}
-  }
+  const servicos = getFieldSafeArray(getField(f, 'servi_os_de_contratos'));
 
   // parcelas pode vir "10X" etc.
   const parcelasRaw = getField(f, 'quantidade_de_parcelas') || '1';
@@ -274,7 +278,7 @@ function montarDados(card) {
     estado_civil: getField(f, 'estado_civil') || '',
     rua: getField(f, 'rua') || '',
     bairro: getField(f, 'bairro') || '',
-    numero: getField(f, 'n_mero') || '',            // corrigido
+    numero: getField(f, 'n_mero') || '',
     cidade: getField(f, 'cidade') || '',
     uf: getField(f, 'uf') || '',
     cep: getField(f, 'cep') || '',
@@ -287,9 +291,9 @@ function montarDados(card) {
 
     // Serviços
     servicos,
-    nome_marca: getField(f, 'neg_cio') || '',       // corrigido
+    nome_marca: getField(f, 'neg_cio') || '',
     classe: getField(f, 'classe') || '',
-    risco: getField(f, 'risco_marca') || '',        // corrigido
+    risco: getField(f, 'risco_marca') || '',
 
     // Remuneração (assessoria)
     valor_total: getField(f, 'valor_do_neg_cio') || '',
@@ -319,7 +323,7 @@ function montarADDWord(d, nowInfo) {
   const parcelaN = totalN / parcelas;
   const valorParcelaSemRS = moneyBRNoSymbol(parcelaN);
 
-  // pesquisa: ISENTA → "R$00,00 via --- 00/00/00" (usando 3 tokens do DOCX)
+  // pesquisa: ISENTA → "R$00,00 via --- 00/00/00"
   const valorPesquisaSemRS = d.pesquisa_status === 'isenta' ? '00,00' : '';
   const formaPagamentoPesquisa = d.pesquisa_status === 'isenta' ? '---' : '';
   const dataPesquisa = d.pesquisa_status === 'isenta' ? '00/00/00' : '';
@@ -382,7 +386,7 @@ function montarADDWord(d, nowInfo) {
     'Data de pagamento da pesquisa': dataPesquisa,
 
     'Valor da Taxa': valorTaxaSemRS,
-    'Forma de pagamento da Taxa': d.forma_pagto_assessoria || '', // se quiser usar outro campo, troque aqui
+    'Forma de pagamento da Taxa': d.forma_pagto_assessoria || '',
     'Data de pagamento da Taxa': fmtDMY2(d.data_pagto_taxa),
 
     // Observações — repetindo a forma de pagamento
