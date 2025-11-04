@@ -1,5 +1,6 @@
 // ============================================================================
 // PIPEFY + D4SIGN (link público externo + confirmação e geração sob demanda)
+// Modelo alinhado ao "CONTRATO NOVO MODELO D4.docx"
 // ============================================================================
 
 const express = require('express');
@@ -120,7 +121,7 @@ async function fetchWithRetry(url, options = {}, { attempts = 5, baseDelayMs = 4
   throw lastErr;
 }
 
-// Pipefy
+// Pipefy base
 async function gql(query, vars) {
   const res = await fetchWithRetry(PIPE_GRAPHQL_ENDPOINT, {
     method: 'POST',
@@ -135,11 +136,37 @@ async function gql(query, vars) {
   }
   return json.data;
 }
+
+// unwrap: aceita string direta, objetos tipo { string_value: "..." } ou strings estilo '{"string_value"=>"..."}'
+function unwrapValue(v) {
+  if (v == null) return '';
+  if (typeof v === 'string') {
+    try {
+      // casos que vêm com => do Ruby
+      if (v.includes('string_value') && v.includes('=>')) {
+        const fixed = v.replace(/=>/g, ':').replace(/:(\s*)([a-zA-Z_]+)/g, ': "$2"');
+        const parsed = JSON.parse(fixed);
+        if (parsed && parsed.string_value) return String(parsed.string_value);
+      }
+      // string normal
+      return v;
+    } catch { return v; }
+  }
+  if (typeof v === 'object' && v.string_value) return String(v.string_value);
+  return String(v);
+}
+
 async function setCardFieldText(cardId, fieldId, text) {
-  const q = `mutation($input: UpdateCardFieldInput!) { updateCardField(input: $input) { card { id } } }`;
+  // grava só string_value para manter o campo limpo (apenas o link)
+  const q = `
+    mutation($input: UpdateCardFieldInput!) {
+      updateCardField(input: $input) { card { id } }
+    }
+  `;
   const vars = { input: { card_id: cardId, field_id: fieldId, new_value: { string_value: String(text) } } };
   await gql(q, vars);
 }
+
 async function moveCardToPhaseSafe(cardId, destPhaseId) {
   const q = `mutation($input: MoveCardToPhaseInput!) { moveCardToPhase(input: $input) { card { id } } }`;
   await gql(q, { input: { card_id: cardId, destination_phase_id: destPhaseId } }).catch(err => {
@@ -147,19 +174,25 @@ async function moveCardToPhaseSafe(cardId, destPhaseId) {
     if (!msg.includes('already in the destination phase')) throw err;
   });
 }
+
 function getField(fields, id) {
   const f = fields.find(x => x.field.id === id || x.field.internal_id === id);
-  return f ? (f.value ?? f.report_value ?? null) : null;
+  if (!f) return null;
+  const v = f.value ?? f.report_value ?? null;
+  return unwrapValue(v);
 }
 
-// Utilitário de moeda BRL
-function toMoneyBRL(v) {
-  const n = Number(String(v ?? '').replace(/[^\d.,-]/g,'').replace(',', '.'));
-  if (!isFinite(n)) return '';
-  return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+// moeda BR
+function onlyNumberBR(v) {
+  const s = String(v ?? '').replace(/[^\d.,-]/g,'').replace(/\.(?=\d{3}(?:\D|$))/g,'').replace(',', '.');
+  const n = Number(s);
+  return isFinite(n) ? n : 0;
+}
+function moneyBRNoSymbol(n) {
+  return Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-// Normalização select/checkbox
+// Normalização select/checkbox de "Sim"
 function normalizeCheck(v) {
   if (v == null) return '';
   if (typeof v === 'boolean') return v ? 'sim' : '';
@@ -171,7 +204,6 @@ function normalizeCheck(v) {
   s = s.toLowerCase();
   return (s === 'true' || s === 'yes' || s === 'sim' || s === 'checked') ? 'sim' : '';
 }
-
 function logDecision(step, obj) {
   try { console.log(`[DECISION] ${step} :: ${JSON.stringify(obj)}`); } catch { console.log(`[DECISION] ${step}`); }
 }
@@ -213,130 +245,132 @@ async function cadastrarSignatarios(tokenAPI, cryptKey, uuidDocument, signers) {
 }
 
 // ============================================================================
-// Montagem de dados do card e tokens do contrato
+// Montagem de dados e tokens compatíveis com o DOCX novo
 // ============================================================================
-
-// Coleta dados do card com os IDs atualizados
 function montarDados(card) {
   const f = card.fields || [];
 
   // serviços pode vir array ou string JSON
-  const serviRaw = getField(f, 'servi_os_de_contratos') || [];
-  let servicos = Array.isArray(serviRaw) ? serviRaw : [];
-  if (typeof serviRaw === 'string') {
-    try { const tmp = JSON.parse(serviRaw); if (Array.isArray(tmp)) servicos = tmp; } catch {}
+  const serviziRaw = getField(f, 'servi_os_de_contratos') || [];
+  let servicos = Array.isArray(serviziRaw) ? serviziRaw : [];
+  if (typeof serviziRaw === 'string') {
+    try { const tmp = JSON.parse(serviziRaw); if (Array.isArray(tmp)) servicos = tmp; } catch {}
   }
 
   return {
-    // identificação
+    // Identificação e endereço
     nome: getField(f, 'nome_do_contato') || '',
+    estado_civil: getField(f, 'estado_civil') || '',
+    rua: getField(f, 'rua') || '',
+    bairro: getField(f, 'bairro') || '',
+    numero: getField(f, 'numero') || '',
+    cidade: getField(f, 'cidade') || '',
+    uf: getField(f, 'uf') || '',
+    cep: getField(f, 'cep') || '',
     rg: getField(f, 'rg') || '',
-    cnpj: getField(f, 'cpf_cnpj') || '',
+    cpf: getField(f, 'cpf_cnpj') || '',
 
-    // contato
+    // Contato
     email: getField(f, 'email_profissional') || '',
     telefone: getField(f, 'telefone') || '',
 
-    // serviços
+    // Serviços
     servicos,
     nome_marca: getField(f, 'nome_marca') || '',
     classe: getField(f, 'classe') || '',
-    detalhes_servico: '', // por enquanto vazio
+    risco: getField(f, 'risco') || '',
 
-    // remuneração assessoria
+    // Remuneração (assessoria)
     valor_total: getField(f, 'valor_do_neg_cio') || '',
     parcelas: Number(getField(f, 'quantidade_de_parcelas') || 1),
 
-    // pesquisa de viabilidade
-    pesquisa_status: getField(f, 'paga') || '', // "paga" ou "isenta"
+    // Pesquisa de viabilidade (select id "paga": paga | isenta)
+    pesquisa_status: String(getField(f, 'paga') || '').toLowerCase(),
 
-    // taxa de encaminhamento
-    taxa_faixa: getField(f, 'copy_of_pesquisa') || '',
+    // Taxa de encaminhamento (select id "copy_of_pesquisa")
+    taxa_faixa: String(getField(f, 'copy_of_pesquisa') || '').toLowerCase(),
 
-    // local e data
-    cidade: getField(f, 'cidade') || '',
-    uf: getField(f, 'uf') || '',
+    // Local e data do rodapé
     dia: getField(f, 'dia') || '',
     mes: getField(f, 'mes') || '',
     ano: getField(f, 'ano') || '',
 
-    // vendedor
+    // Vendedor p/ cofre
     vendedor: card.assignees?.[0]?.name || 'Desconhecido'
   };
 }
 
-// Constrói tokens para o Word conforme as regras pedidas
 function montarADDWord(d) {
-  // valor da parcela = total dividido por parcelas
+  // parcelas e valor da parcela (sem "R$")
   const parcelas = Math.max(1, Number(d.parcelas || 1));
-  const nTotal = Number(String(d.valor_total ?? '').replace(/[^\d.,-]/g,'').replace(',', '.'));
-  const valorParcela = isFinite(nTotal) ? toMoneyBRL(nTotal / parcelas) : '';
+  const totalN = onlyNumberBR(d.valor_total);
+  const parcelaN = totalN / parcelas;
+  const valorParcelaSemRS = moneyBRNoSymbol(parcelaN);
 
-  // pesquisa de viabilidade
-  const isIsenta = String(d.pesquisa_status).trim().toLowerCase() === 'isenta';
-  const valorPesquisa = isIsenta ? 'Isenta' : ''; // se for paga, deixamos vazio por enquanto
-  const formaPesquisa = '';
-  const dataPesquisa = '';
+  // pesquisa: se isenta, deixamos o token numérico vazio (seu DOCX usa "R$ ${Valor da Pesquisa},00")
+  const valorPesquisaSemRS = d.pesquisa_status === 'isenta' ? '' : '';
 
-  // taxa de encaminhamento
-  let valorTaxa = '';
-  const taxa = String(d.taxa_faixa).toLowerCase();
-  if (taxa.includes('440')) valorTaxa = 'R$ 440,00';
-  else if (taxa.includes('880')) valorTaxa = 'R$ 880,00';
+  // taxa
+  let valorTaxaSemRS = '';
+  const taxa = String(d.taxa_faixa);
+  if (taxa.includes('440')) valorTaxaSemRS = '440,00';
+  else if (taxa.includes('880')) valorTaxaSemRS = '880,00';
 
   // serviços: pedido de registro de marca
-  let servicoMarcaQtd = '';
-  let descServicoMarca = '';
-  let detalhesServicoMarca = '';
-  const temMarca = d.servicos.some(s => String(s).toLowerCase().includes('pedido de registro de marca') || String(s).toLowerCase().includes('registro de marca') || String(s).toLowerCase().includes('marca'));
-  if (temMarca) {
-    servicoMarcaQtd = '1';
-    const marca = d.nome_marca ? `Marca: ${d.nome_marca}` : '';
-    const classe = d.classe ? `Classe: ${d.classe}` : '';
-    descServicoMarca = [marca, classe].filter(Boolean).join('  ');
-    detalhesServicoMarca = d.detalhes_servico || '';
-  }
+  const temMarca = d.servicos.some(s =>
+    String(s).toLowerCase().includes('pedido de registro de marca') ||
+    String(s).toLowerCase().includes('registro de marca') ||
+    String(s).toLowerCase().includes('marca')
+  );
+  const qtdMarca = temMarca ? '1' : '';
+  const descMarca = temMarca
+    ? [
+        d.nome_marca ? `Marca: ${d.nome_marca}` : '',
+        d.classe ? `Classe: ${d.classe}` : ''
+      ].filter(Boolean).join(', ')
+    : '';
 
+  // Retorna com os nomes literais dos TOKENS no DOCX
   return {
-    // contratante
-    contratante_1: d.nome || '',
-    rg_contratante_1: d.rg || '',
-    cnpj: d.cnpj || '',
+    'Contratante 1': d.nome,
+    'Estado Civíl': d.estado_civil,
+    'rua': d.rua,
+    'Bairro': d.bairro,
+    'Numero': d.numero,
+    'Nome da cidade': d.cidade,
+    'UF': d.uf,
+    'CEP': d.cep,
+    'RG': d.rg,
+    'CPF': d.cpf,
+    'Telefone': d.telefone,
+    'E-mail': d.email,
 
-    // contato
-    dados_para_contato: [d.email, d.telefone].filter(Boolean).join(' / '),
+    'Risco': d.risco,
 
-    // assessoria
-    numero_de_parcelas_da_assessoria: String(parcelas),
-    valor_da_parcela_da_assessoria: valorParcela,
-    forma_de_pagamento_da_assessoria: '', // não solicitado
-    data_de_pagamento_da_assessoria: '',  // não solicitado
+    'Quantidade depósitos/processos de MARCA': qtdMarca,
+    'Nome da Marca': d.nome_marca,
+    'Classe': d.classe,
 
-    // pesquisa viabilidade
-    valor_da_pesquisa: valorPesquisa,
-    forma_de_pagamento_da_pesquisa: formaPesquisa,
-    data_de_pagamento_da_pesquisa: dataPesquisa,
+    'Número de parcelas da Assessoria': String(parcelas),
+    'Valor da parcela da Assessoria': valorParcelaSemRS, // ex.: "123,45" (sem R$)
+    'Forma de pagamento da Assessoria': '',
+    'Data de pagamento da Assessoria': '',
 
-    // taxa de encaminhamento
-    valor_da_taxa: valorTaxa,
-    forma_de_pagamento_da_taxa: '',
-    data_de_pagamento_da_taxa: '',
+    'Valor da Pesquisa': valorPesquisaSemRS,            // vazio quando isenta
+    'Forma de pagamento da Pesquisa': '',
+    'Data de pagamento da pesquisa': '',
 
-    // serviços – marca
-    servico_marca_quantidade: servicoMarcaQtd,
-    descricao_do_servico_marca: descServicoMarca,
-    detalhes_do_servico_marca: detalhesServicoMarca,
+    'Valor da Taxa': valorTaxaSemRS,                    // "440,00" ou "880,00"
+    'Forma de pagamento da Taxa': '',
+    'Data de pagamento da Taxa': '',
 
-    // local e data
-    cidade: d.cidade || '',
-    uf: d.uf || '',
-    dia: d.dia || '',
-    mes: d.mes || '',
-    ano: d.ano || ''
+    'Cidade': d.cidade,
+    'Dia': d.dia,
+    'Mês': d.mes,
+    'Ano': d.ano
   };
 }
 
-// Signers
 function montarSigners(d) {
   return [{ email: d.email, name: d.nome, act: '1', foreign: '0', send_email: '1' }];
 }
@@ -403,24 +437,24 @@ app.get('/lead/:token', async (req, res) => {
     <h2>Contratante(s)</h2>
     <div class="grid">
       <div><div class="label">Nome</div><div>${d.nome||'-'}</div></div>
-      <div><div class="label">CPF/CNPJ</div><div>${d.cnpj||'-'}</div></div>
+      <div><div class="label">CPF</div><div>${d.cpf||'-'}</div></div>
       <div><div class="label">RG</div><div>${d.rg||'-'}</div></div>
     </div>
 
-    <h2>Dados para contato</h2>
+    <h2>Contato</h2>
     <div class="grid">
       <div><div class="label">E-mail</div><div>${d.email||'-'}</div></div>
       <div><div class="label">Telefone</div><div>${d.telefone||'-'}</div></div>
     </div>
 
+    <h2>Serviços</h2>
+    <div>${(d.servicos||[]).join(', ') || '-'}</div>
+
     <h2>Remuneração</h2>
     <div class="grid">
       <div><div class="label">Parcelas</div><div>${String(d.parcelas||'1')}</div></div>
-      <div><div class="label">Valor total</div><div>${toMoneyBRL(d.valor_total)||'-'}</div></div>
+      <div><div class="label">Valor total</div><div>${moneyBRNoSymbol(onlyNumberBR(d.valor_total))}</div></div>
     </div>
-
-    <h2>Serviços</h2>
-    <div>${(d.servicos||[]).join(', ') || '-'}</div>
 
     <form method="POST" action="/lead/${encodeURIComponent(req.params.token)}/generate" style="margin-top:24px">
       <button class="btn" type="submit">Gerar contrato</button>
@@ -486,7 +520,7 @@ app.post('/lead/:token/generate', async (req, res) => {
 });
 
 // ============================================================================
-// WEBHOOK PIPEFY: cria o link público no campo do card
+// WEBHOOK PIPEFY: cria o link público no campo do card (apenas a URL pura)
 // ============================================================================
 app.post('/pipefy', async (req, res) => {
   console.log('[PIPEFY] webhook recebido em /pipefy');
@@ -512,14 +546,15 @@ app.post('/pipefy', async (req, res) => {
     const f = card.fields || [];
 
     const disparo = normalizeCheck(getField(f, FIELD_ID_CHECKBOX_DISPARO));
-    const rawLink = getField(f, FIELD_ID_LINKS_D4);
-    logDecision('estado_atual', { cardId, disparo, rawLink });
+    const already = getField(f, FIELD_ID_LINKS_D4);
+    logDecision('estado_atual', { cardId, disparo, rawLink: already });
 
     if (disparo !== 'sim') {
       releaseLock(lockKey);
       return res.status(200).json({ ok: true, message: 'Campo gerar_contrato != Sim' });
     }
 
+    // Gera link público e grava apenas o texto puro
     const token = mkLeadToken(card.id);
     const leadUrl = `${PUBLIC_BASE_URL.replace(/\/$/,'')}/lead/${encodeURIComponent(token)}`;
     await setCardFieldText(card.id, FIELD_ID_LINKS_D4, leadUrl);
