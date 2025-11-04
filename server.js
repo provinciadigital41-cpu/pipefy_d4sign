@@ -126,7 +126,7 @@ async function gql(query, vars) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${PIPE_API_KEY}` },
     body: JSON.stringify({ query, variables: vars })
-  }, { attempts: 5, baseDelayMs: 500, timeoutMs: 20000 });
+  }, { attempts: 5, baseDelayMs: 500, timeoutMs = 20000 });
 
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json.errors) {
@@ -181,6 +181,19 @@ function onlyNumberBR(v) {
 }
 function moneyBRNoSymbol(n) {
   return Number(n).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// datas
+const MESES_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+function monthNamePt(mIndex1to12) { return MESES_PT[(Math.max(1, Math.min(12, Number(mIndex1to12))) - 1)]; }
+function fmtDMY2(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  if (isNaN(d)) return '';
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const yy = String(d.getFullYear()).slice(-2);
+  return `${dd}/${mm}/${yy}`;
 }
 
 // Normalização select/checkbox de "Sim"
@@ -281,7 +294,11 @@ function montarDados(card) {
     // Remuneração (assessoria)
     valor_total: getField(f, 'valor_do_neg_cio') || '',
     parcelas: parcelasNum,
-    forma_pagto_assessoria: getField(f, 'm_todo_de_pagamento') || '', // novo
+    forma_pagto_assessoria: getField(f, 'm_todo_de_pagamento') || '',
+
+    // Datas de pagamento (novos campos)
+    data_pagto_assessoria: getField(f, 'data_de_pagamento_assessoria') || '',
+    data_pagto_taxa: getField(f, 'data_de_pagamento_da_taxa') || '',
 
     // Pesquisa de viabilidade (select id "paga": paga | isenta)
     pesquisa_status: String(getField(f, 'paga') || '').toLowerCase(),
@@ -294,7 +311,7 @@ function montarDados(card) {
   };
 }
 
-// nowInfo é a data do momento da geração
+// nowInfo é a data do momento da geração (com mês por extenso)
 function montarADDWord(d, nowInfo) {
   // parcelas e valor da parcela (sem "R$")
   const parcelas = Math.max(1, Number(d.parcelas || 1));
@@ -302,8 +319,10 @@ function montarADDWord(d, nowInfo) {
   const parcelaN = totalN / parcelas;
   const valorParcelaSemRS = moneyBRNoSymbol(parcelaN);
 
-  // pesquisa: se isenta, deixamos vazio pois o DOCX usa "R$ ${Valor da Pesquisa},00"
-  const valorPesquisaSemRS = d.pesquisa_status === 'isenta' ? '' : '';
+  // pesquisa: ISENTA → "R$00,00 via --- 00/00/00" (usando 3 tokens do DOCX)
+  const valorPesquisaSemRS = d.pesquisa_status === 'isenta' ? '00,00' : '';
+  const formaPagamentoPesquisa = d.pesquisa_status === 'isenta' ? '---' : '';
+  const dataPesquisa = d.pesquisa_status === 'isenta' ? '00/00/00' : '';
 
   // taxa
   let valorTaxaSemRS = '';
@@ -325,12 +344,12 @@ function montarADDWord(d, nowInfo) {
       ].filter(Boolean).join(', ')
     : '';
 
-  // Data baseada no momento da geração
+  // Data no rodapé com base na geração
   const Dia = String(nowInfo.dia).padStart(2, '0');
-  const Mes = String(nowInfo.mes).padStart(2, '0');
+  const Mes = nowInfo.mesNome; // por extenso
   const Ano = String(nowInfo.ano);
 
-  // Observações: repetir forma de pagamento
+  // Observações: repetir forma de pagamento da assessoria
   const observacoes = d.forma_pagto_assessoria || '';
 
   return {
@@ -356,21 +375,21 @@ function montarADDWord(d, nowInfo) {
     'Número de parcelas da Assessoria': String(parcelas),
     'Valor da parcela da Assessoria': valorParcelaSemRS,
     'Forma de pagamento da Assessoria': d.forma_pagto_assessoria || '',
-    'Data de pagamento da Assessoria': '',
+    'Data de pagamento da Assessoria': fmtDMY2(d.data_pagto_assessoria),
 
     'Valor da Pesquisa': valorPesquisaSemRS,
-    'Forma de pagamento da Pesquisa': '',
-    'Data de pagamento da pesquisa': '',
+    'Forma de pagamento da Pesquisa': formaPagamentoPesquisa,
+    'Data de pagamento da pesquisa': dataPesquisa,
 
     'Valor da Taxa': valorTaxaSemRS,
-    'Forma de pagamento da Taxa': '',
-    'Data de pagamento da Taxa': '',
+    'Forma de pagamento da Taxa': d.forma_pagto_assessoria || '', // se quiser usar outro campo, troque aqui
+    'Data de pagamento da Taxa': fmtDMY2(d.data_pagto_taxa),
 
     // Observações — repetindo a forma de pagamento
     'Observações': observacoes,
     'Observacoes': observacoes,
 
-    // Data no rodapé com base na geração
+    // Data no rodapé
     'Cidade': d.cidade,
     'Dia': Dia,
     'Mês': Mes,
@@ -500,9 +519,14 @@ app.post('/lead/:token/generate', async (req, res) => {
     const card = data.card;
     const d = montarDados(card);
 
-    // Data do momento da geração
+    // Data do momento da geração (com mês por extenso)
     const now = new Date();
-    const nowInfo = { dia: now.getDate(), mes: now.getMonth()+1, ano: now.getFullYear() };
+    const nowInfo = {
+      dia: now.getDate(),
+      mes: now.getMonth()+1,
+      ano: now.getFullYear(),
+      mesNome: monthNamePt(now.getMonth()+1)
+    };
 
     const add = montarADDWord(d, nowInfo);
     const signers = montarSigners(d);
